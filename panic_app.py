@@ -2,17 +2,21 @@ import streamlit as st
 import requests
 import math
 import smtplib
-import json
-import hashlib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from streamlit_js_eval import streamlit_js_eval
 
 st.title("🚨 One-Click Emergency Panic Button")
 
-# ---------- GMAIL CONFIG (from Streamlit Secrets) ----------
-SENDER_EMAIL = st.secrets["SENDER_EMAIL"]
-SENDER_APP_PASSWORD = st.secrets["SENDER_APP_PASSWORD"]
+# ---------- GMAIL CONFIG ----------
+SENDER_EMAIL = "SENDER_EMAIL"       # your Gmail address
+SENDER_APP_PASSWORD = "SENDER_EMAIL_PASSWORD"   # 16-char app password (no spaces)
+
+# ---------- DEFAULT HARDCODED CONTACTS ----------
+DEFAULT_CONTACTS = [
+    {"name": "Mum", "email": "mum@example.com"},
+    {"name": "Dad", "email": "dad@example.com"},
+]
 
 # ---------- GET LOCATION ----------
 location = streamlit_js_eval(
@@ -74,18 +78,24 @@ def find_police(lat, lon, radius=5000):
 # ---------- SEND EMAIL ----------
 def send_email(recipient_name, recipient_email, lat, lon):
     maps_link = f"https://maps.google.com/?q={lat},{lon}"
+
+    # --- HTML email body ---
     html_body = f"""
     <html>
     <body style="font-family: Arial, sans-serif; background-color: #f8f8f8; padding: 20px;">
         <div style="max-width: 500px; margin: auto; background: white; border-radius: 10px;
                     border-top: 6px solid red; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+
             <h1 style="color: red; text-align: center;">🚨 EMERGENCY ALERT</h1>
+
             <p style="font-size: 16px;">Dear <b>{recipient_name}</b>,</p>
+
             <p style="font-size: 16px;">
                 This is an automated emergency alert.<br><br>
                 <b>I need help immediately!</b><br>
                 Please contact me or call <b>999</b> right away.
             </p>
+
             <div style="background-color: #fff3f3; border-left: 4px solid red;
                         padding: 15px; border-radius: 5px; margin: 20px 0;">
                 <p style="margin: 0; font-size: 15px;">
@@ -94,12 +104,14 @@ def send_email(recipient_name, recipient_email, lat, lon):
                     Longitude: <code>{lon:.6f}</code>
                 </p>
             </div>
+
             <a href="{maps_link}" style="display: block; text-align: center;
                background-color: red; color: white; padding: 14px 20px;
                border-radius: 8px; text-decoration: none; font-size: 16px;
                font-weight: bold; margin-top: 10px;">
                📍 OPEN MY LOCATION IN GOOGLE MAPS
             </a>
+
             <p style="font-size: 12px; color: #999; text-align: center; margin-top: 20px;">
                 This alert was sent automatically via Emergency Panic Button App.
             </p>
@@ -107,15 +119,18 @@ def send_email(recipient_name, recipient_email, lat, lon):
     </body>
     </html>
     """
+
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = "🚨 EMERGENCY ALERT — I Need Help Now!"
         msg["From"] = SENDER_EMAIL
         msg["To"] = recipient_email
         msg.attach(MIMEText(html_body, "html"))
+
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
             server.sendmail(SENDER_EMAIL, recipient_email, msg.as_string())
+
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -132,98 +147,54 @@ def send_email_to_all(lat, lon, contacts):
         })
     return results
 
-# ---------- PERSISTENT CONTACTS PER USER ----------
-# Generate a unique storage key per browser session
-def get_user_key():
-    # streamlit_js_eval returns a unique tab ID we can use to separate users
-    return streamlit_js_eval(js_expressions="window.sessionStorage.getItem('uid') || (() => { const id = Math.random().toString(36).slice(2); window.sessionStorage.setItem('uid', id); return id; })()", key="uid")
-
-user_id = get_user_key()
-
-async def load_contacts():
-    if user_id:
-        try:
-            result = await st.context.storage.get(f"contacts:{user_id}")
-            return json.loads(result.value) if result else []
-        except:
-            return []
-    return []
-
-# Use session state as working memory, synced with persistent storage
-if "contacts_loaded" not in st.session_state:
-    st.session_state.contacts_loaded = False
-    st.session_state.user_contacts = []
-
-# Load from persistent storage on first run
-if user_id and not st.session_state.contacts_loaded:
-    try:
-        import asyncio
-        # Use streamlit_js_eval to read from localStorage instead
-        raw = streamlit_js_eval(
-            js_expressions=f"localStorage.getItem('contacts_{user_id}')",
-            key="load_contacts"
-        )
-        if raw:
-            st.session_state.user_contacts = json.loads(raw)
-        st.session_state.contacts_loaded = True
-    except:
-        st.session_state.contacts_loaded = True
-
-def save_contacts_to_browser(contacts, uid):
-    """Save contacts to browser localStorage so they persist across refreshes."""
-    contacts_json = json.dumps(contacts).replace("'", "\\'")
-    streamlit_js_eval(
-        js_expressions=f"localStorage.setItem('contacts_{uid}', '{contacts_json}'); 'saved'",
-        key=f"save_{len(contacts)}_{hash(str(contacts))}"
-    )
-
 # ---------- SIDEBAR: MANAGE CONTACTS ----------
-st.sidebar.header("📋 My Emergency Contacts")
-st.sidebar.caption("These are saved in your browser and persist across refreshes.")
+st.sidebar.header("📋 Emergency Contacts")
+st.sidebar.caption("Default contacts:")
+for c in DEFAULT_CONTACTS:
+    st.sidebar.write(f"✅ {c['name']} — {c['email']}")
+
+st.sidebar.divider()
+st.sidebar.caption("Add extra contacts for this session:")
+
+if "extra_contacts" not in st.session_state:
+    st.session_state.extra_contacts = []
 
 with st.sidebar.form("add_contact_form", clear_on_submit=True):
-    new_name = st.text_input("Name", placeholder="e.g. Mum")
-    new_email = st.text_input("Email", placeholder="e.g. mum@gmail.com")
+    new_name = st.text_input("Name", placeholder="e.g. Sister")
+    new_email = st.text_input("Email", placeholder="e.g. sister@gmail.com")
     add_btn = st.form_submit_button("➕ Add Contact")
     if add_btn:
         if new_name and new_email:
-            st.session_state.user_contacts.append({
+            st.session_state.extra_contacts.append({
                 "name": new_name,
                 "email": new_email
             })
-            if user_id:
-                save_contacts_to_browser(st.session_state.user_contacts, user_id)
-            st.success(f"{new_name} added and saved!")
+            st.success(f"{new_name} added!")
         else:
             st.warning("Please fill in both fields.")
 
-if st.session_state.user_contacts:
-    st.sidebar.caption(f"{len(st.session_state.user_contacts)} contact(s) saved:")
-    for i, c in enumerate(st.session_state.user_contacts):
+if st.session_state.extra_contacts:
+    st.sidebar.caption("Added this session:")
+    for i, c in enumerate(st.session_state.extra_contacts):
         col1, col2 = st.sidebar.columns([3, 1])
-        col1.write(f"✅ {c['name']} — {c['email']}")
+        col1.write(f"➕ {c['name']} — {c['email']}")
         if col2.button("🗑️", key=f"del_{i}"):
-            st.session_state.user_contacts.pop(i)
-            if user_id:
-                save_contacts_to_browser(st.session_state.user_contacts, user_id)
+            st.session_state.extra_contacts.pop(i)
             st.rerun()
-else:
-    st.sidebar.info("No contacts yet. Add at least one contact above.")
 
 # ---------- PANIC BUTTON ----------
 st.divider()
-total = len(st.session_state.user_contacts)
-st.caption(f"📧 Alert will be sent to {total} contact(s) when PANIC is pressed.")
+all_contacts = DEFAULT_CONTACTS + st.session_state.extra_contacts
+st.caption(f"📧 Alert email will be sent to {len(all_contacts)} contact(s) when PANIC is pressed.")
 
 if st.button("🚨 PANIC", use_container_width=True, type="primary"):
-    if not st.session_state.user_contacts:
-        st.warning("⚠️ Please add at least one emergency contact in the sidebar first.")
-    elif location:
+    if location:
         lat, lon = location
         st.success(f"📍 Location detected: {lat:.5f}, {lon:.5f}")
 
+        # --- Send Emails ---
         st.info("📤 Sending emergency emails...")
-        results = send_email_to_all(lat, lon, st.session_state.user_contacts)
+        results = send_email_to_all(lat, lon, all_contacts)
 
         for r in results:
             if r["success"]:
@@ -231,6 +202,7 @@ if st.button("🚨 PANIC", use_container_width=True, type="primary"):
             else:
                 st.error(f"❌ Failed to send to {r['name']} — {r['error']}")
 
+        # --- Find Police ---
         with st.spinner("🔍 Locating nearest police station..."):
             police = find_police(lat, lon, radius=5000)
 
@@ -245,7 +217,6 @@ if st.button("🚨 PANIC", use_container_width=True, type="primary"):
             st.link_button("🚓 GO TO POLICE NOW", nav)
         else:
             st.error("No police station found in the area.")
+
     else:
         st.error("⚠️ Location not available — refresh the page and allow location permission.")
-
-
