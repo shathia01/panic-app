@@ -247,4 +247,3 @@ if st.button("🚨 PANIC", use_container_width=True, type="primary"):
             st.error("No police station found in the area.")
     else:
         st.error("⚠️ Location not available — refresh the page and allow location permission.")
-
