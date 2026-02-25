@@ -10,7 +10,7 @@ st.title("🚨 One-Click Emergency Panic Button")
 
 # ---------- GMAIL CONFIG ----------
 SENDER_EMAIL = "SENDER_EMAIL"       # your Gmail address
-SENDER_APP_PASSWORD = "SENDER_EMAIL_PASSWORD"   # 16-char app password (no spaces)
+SENDER_APP_PASSWORD = "SENDER_APP_PASSWORD"   # 16-char app password (no spaces)
 
 # ---------- DEFAULT HARDCODED CONTACTS ----------
 DEFAULT_CONTACTS = [
@@ -220,3 +220,4 @@ if st.button("🚨 PANIC", use_container_width=True, type="primary"):
 
     else:
         st.error("⚠️ Location not available — refresh the page and allow location permission.")
+
