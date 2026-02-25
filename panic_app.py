@@ -9,12 +9,12 @@ from streamlit_js_eval import streamlit_js_eval
 st.title("🚨 One-Click Emergency Panic Button")
 
 # ---------- GMAIL CONFIG ----------
-SENDER_EMAIL = "shathiatesting@gmail.com"       # your Gmail address
-SENDER_APP_PASSWORD = "ooueycgzdmnllhxk"   # 16-char app password (no spaces)
+SENDER_EMAIL = "shathia190304@gmail.com"       # your Gmail address
+SENDER_APP_PASSWORD = "kvskirvfdhsscege"   # 16-char app password (no spaces)
 
 # ---------- DEFAULT HARDCODED CONTACTS ----------
 DEFAULT_CONTACTS = [
-    {"name": "Mum", "email": "shathiatesting@gmail.com"},
+    {"name": "Mum", "email": "shathia190304@gmail.com"},
     {"name": "Dad", "email": "dad@example.com"},
 ]
 
@@ -220,7 +220,3 @@ if st.button("🚨 PANIC", use_container_width=True, type="primary"):
 
     else:
         st.error("⚠️ Location not available — refresh the page and allow location permission.")
-
-
-
-
