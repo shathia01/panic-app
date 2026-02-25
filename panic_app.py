@@ -11,8 +11,8 @@ from streamlit_js_eval import streamlit_js_eval
 st.title("🚨 One-Click Emergency Panic Button")
 
 # ---------- GMAIL CONFIG (from Streamlit Secrets) ----------
-SENDER_EMAIL = st.secrets["SENDER_EMAIL"]
-SENDER_APP_PASSWORD = st.secrets["SENDER_APP_PASSWORD"]
+SENDER_EMAIL = st.secrets["shathiatesting@gmail.com"]
+SENDER_APP_PASSWORD = st.secrets["ooueycgzdmnllhxk"]
 
 # ---------- GET LOCATION ----------
 location = streamlit_js_eval(
@@ -247,3 +247,4 @@ if st.button("🚨 PANIC", use_container_width=True, type="primary"):
             st.error("No police station found in the area.")
     else:
         st.error("⚠️ Location not available — refresh the page and allow location permission.")
+
