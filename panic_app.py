@@ -4,12 +4,13 @@ import math
 import smtplib
 import json
 import time
-import uuid
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
 from streamlit_js_eval import streamlit_js_eval
+import uuid
+import hashlib
 
 st.title("🚨 One-Click Emergency Panic Button")
 
@@ -54,18 +55,31 @@ for key, default in [
     ("motion_tracking_locations", []),
     ("motion_last_sent", None),
     ("motion_listen_key", 0),
-    # Guardian mode states
+    # Guardian Mode states
     ("guardian_active", False),
     ("guardian_session_id", None),
     ("guardian_destination", ""),
     ("guardian_update_count", 0),
     ("guardian_locations", []),
     ("guardian_last_sent", None),
-    ("guardian_update_key", 0),
-    ("guardian_safe_pressed", False),
+    ("guardian_loc_key", 0),
+    ("guardian_journey_ended", False),
+    ("guardian_link_sent", False),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
+
+# ---------- SHARED GUARDIAN STORE (server-side, in-memory) ----------
+# This acts as the shared store between user and guardian viewer
+if "guardian_store" not in st.session_state:
+    st.session_state["guardian_store"] = {}
+
+# Global store across all sessions using st.cache_resource
+@st.cache_resource
+def get_guardian_store():
+    return {}
+
+guardian_store = get_guardian_store()
 
 # ---------- READ SAVED CONTACT FROM localStorage ----------
 raw = streamlit_js_eval(js_expressions="localStorage.getItem('emergency_my_contacts')", key="read_my_contacts")
@@ -79,10 +93,6 @@ if raw and raw != "null":
             my_contacts = parsed
     except Exception:
         my_contacts = []
-
-# ---------- READ GUARDIAN SESSION FROM URL PARAMS ----------
-query_params = st.query_params
-guardian_view_id = query_params.get("guardian", None)
 
 # ---------- HAVERSINE ----------
 def haversine(lat1, lon1, lat2, lon2):
@@ -128,17 +138,13 @@ def find_police(lat, lon, radius=5000):
 # ---------- SEND EMAIL ----------
 def send_email(recipient_name, recipient_email, lat, lon, update_num=None, accuracy=None,
                voice_triggered=False, trigger_word="", motion_triggered=False,
-               guardian_triggered=False, guardian_session_id=None, destination="",
-               journey_safe=False, base_url=""):
+               guardian_mode=False, guardian_link="", destination=""):
     maps_link = f"https://maps.google.com/?q={lat},{lon}"
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     is_update = update_num is not None
 
-    if journey_safe:
-        subject = "✅ SAFE - Journey Completed - Guardian Alert"
-        alert_type = "SAFE"
-    elif guardian_triggered:
-        subject = f"👁️ GUARDIAN MODE - Live Journey Tracking Started"
+    if guardian_mode:
+        subject = f"🛡️ Guardian Mode Started — Live Journey Tracking"
         alert_type = "GUARDIAN"
     elif motion_triggered:
         subject = f"📳 MOTION ALERT - Shaking/Running Detected - Emergency"
@@ -154,76 +160,83 @@ def send_email(recipient_name, recipient_email, lat, lon, update_num=None, accur
         alert_type = "PANIC"
 
     acc_text = f"+-{accuracy:.0f}m" if accuracy else "N/A"
+    voice_note = f'\n⚠️ Triggered by voice: "{trigger_word}"\n' if voice_triggered else ""
+    motion_note = "\n⚠️ Triggered by device motion/shaking — person may be in distress!\n" if motion_triggered else ""
 
-    # Guardian live tracking link
-    guardian_link = ""
-    guardian_html_block = ""
-    if guardian_triggered and guardian_session_id and base_url:
-        guardian_link = f"{base_url}?guardian={guardian_session_id}"
-        guardian_html_block = f"""
-        <div style="background:#e8f5e9;border-left:4px solid #2e7d32;padding:15px;border-radius:5px;margin:15px 0;">
-            <p style="margin:0;font-size:15px;"><b>🔴 LIVE TRACKING LINK</b><br>
-            Open this link to watch their journey in real-time:<br>
-            <a href="{guardian_link}" style="color:#1565c0;word-break:break-all;">{guardian_link}</a><br>
-            <small>This link updates every 10 seconds with their live location.</small>
-            </p>
-        </div>"""
+    destination_text = f"\nDestination: {destination}" if destination else ""
 
-    safe_html_block = ""
-    if journey_safe:
-        safe_html_block = """
-        <div style="background:#e8f5e9;border:2px solid #2e7d32;padding:15px;border-radius:8px;margin:15px 0;text-align:center;">
-            <h2 style="color:#2e7d32;margin:0;">✅ THEY ARE SAFE</h2>
-            <p style="margin:5px 0;">The user has confirmed they reached their destination safely.</p>
-        </div>"""
-
-    plain_guardian = f"\n🔴 LIVE TRACKING LINK: {guardian_link}\nOpen to watch their journey in real-time.\n" if guardian_link else ""
-    plain_safe = "\n✅ THE USER HAS CONFIRMED THEY ARE SAFE AND REACHED THEIR DESTINATION.\n" if journey_safe else ""
-    dest_text = f"\nDestination: {destination}" if destination else ""
-
-    plain = f"""{'✅ SAFE ARRIVAL CONFIRMED' if journey_safe else ('👁️ GUARDIAN LIVE MONITORING STARTED' if guardian_triggered else ('📳 MOTION ALERT' if motion_triggered else ('🎙️ VOICE ALERT' if voice_triggered else ('LIVE UPDATE #' + str(update_num) if is_update else 'EMERGENCY ALERT'))))}
+    plain = f"""{'🛡️ GUARDIAN LIVE MONITORING MODE STARTED' if guardian_mode else ('📳 MOTION-TRIGGERED EMERGENCY ALERT' if motion_triggered else ('🎙️ VOICE-TRIGGERED EMERGENCY ALERT' if voice_triggered else ('LIVE TRACKING UPDATE #' + str(update_num) if is_update else 'EMERGENCY ALERT')))}
 
 Dear {recipient_name},
 
-{'The user has confirmed they reached their destination safely. Journey monitoring has ended.' if journey_safe else ('Guardian Live Monitoring has started. You can now track their journey in real-time.' if guardian_triggered else ('Rapid device shaking detected.' if motion_triggered else (f'Distress word "{trigger_word}" detected.' if voice_triggered else ('Live tracking update.' if is_update else 'Emergency Panic Button was activated.'))))}
-{plain_safe}{plain_guardian}{dest_text}
+{'🛡️ GUARDIAN MODE: Someone has started their journey and wants you to monitor them live. Click the link below to watch their location in real-time.' if guardian_mode else ('⚠️ MOTION ALERT: Rapid shaking or running motion was automatically detected on the device!' if motion_triggered else ('⚠️ VOICE DISTRESS DETECTION: The word "' + trigger_word + '" was detected. Auto-alert triggered!' if voice_triggered else ('This is a LIVE LOCATION UPDATE. The person is moving.' if is_update else 'Someone triggered the Emergency Panic Button.')))}
 
-Location: {lat:.6f}, {lon:.6f}
-Accuracy: {acc_text}
+{'Call emergency services (999) immediately.' if not guardian_mode else ''}
+{voice_note}{motion_note}
+Current Location: {lat:.6f}, {lon:.6f}
+Accuracy: {acc_text}{destination_text}
 Google Maps: {maps_link}
 Time: {timestamp}
+{f'LIVE TRACKER LINK: {guardian_link}' if guardian_mode and guardian_link else ''}
 """
 
-    color = "#2e7d32" if journey_safe else ("#1a6b3c" if guardian_triggered else ("#7B3F00" if motion_triggered else ("#4a0080" if voice_triggered else ("#8B0000" if is_update else "red"))))
+    guardian_banner = f"""
+        <div style="background:#0a5c2e;color:white;padding:12px 15px;border-radius:6px;margin-bottom:15px;text-align:center;">
+            🛡️ <b>GUARDIAN MODE ACTIVE</b> — Live journey tracking has started!
+        </div>""" if guardian_mode else ""
+
+    motion_banner = """
+        <div style="background:#7B3F00;color:white;padding:12px 15px;border-radius:6px;margin-bottom:15px;text-align:center;">
+            📳 <b>MOTION ALERT</b> — Rapid device shaking or running detected!
+        </div>""" if motion_triggered else ""
+
+    voice_banner = f"""
+        <div style="background:#4a0080;color:white;padding:12px 15px;border-radius:6px;margin-bottom:15px;text-align:center;">
+            🎙️ <b>VOICE ALERT</b> — Distress word detected: <b>"{trigger_word}"</b>
+        </div>""" if voice_triggered else ""
+
+    color = "#0a5c2e" if guardian_mode else ("#7B3F00" if motion_triggered else ("#4a0080" if voice_triggered else ("#8B0000" if is_update else "red")))
     header_text = (
-        "✅ SAFE — Journey Completed" if journey_safe else
-        ("👁️ Guardian Mode — Live Journey Started" if guardian_triggered else
-         ("📳 MOTION ALERT" if motion_triggered else
-          (f'🎙️ VOICE ALERT: "{trigger_word}"' if voice_triggered else
-           (f"LIVE UPDATE #{update_num}" if is_update else "Emergency Alert"))))
+        '🛡️ Guardian Live Monitoring Started' if guardian_mode else
+        ('📳 MOTION ALERT: Device Shaking Detected' if motion_triggered else
+         (f'🎙️ VOICE ALERT: "{trigger_word}"' if voice_triggered else
+          (f'LIVE UPDATE #{update_num}' if is_update else 'Emergency Alert')))
     )
+
+    live_tracker_button = f"""
+        <a href="{guardian_link}" style="display:block;text-align:center;
+           background:#0a5c2e;color:white;padding:14px 20px;
+           border-radius:8px;text-decoration:none;font-size:16px;font-weight:bold;margin-top:10px;">
+            🗺️ Open Live Tracker Map
+        </a>
+        <p style="text-align:center;font-size:12px;color:#555;margin-top:8px;">
+            This link shows their real-time location. Refresh anytime to see latest position.
+        </p>
+    """ if guardian_mode and guardian_link else ""
+
+    destination_html = f"""
+        <div style="background:#e8f5e9;border-left:4px solid #0a5c2e;padding:10px;border-radius:5px;margin:10px 0;">
+            <b>📍 Destination:</b> {destination}
+        </div>
+    """ if destination else ""
 
     html = f"""
     <html><body style="font-family:Arial,sans-serif;background:#f8f8f8;padding:20px;">
-    <div style="max-width:520px;margin:auto;background:white;border-radius:10px;
+    <div style="max-width:500px;margin:auto;background:white;border-radius:10px;
                 border-top:6px solid {color};padding:30px;
                 box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+        {guardian_banner}{motion_banner}{voice_banner}
         <h1 style="color:{color};text-align:center;">{header_text}</h1>
         <p>Dear <b>{recipient_name}</b>,</p>
-        {safe_html_block}
-        {guardian_html_block}
         <p>
-            {'The user has confirmed they reached their destination safely. Journey monitoring has ended.' if journey_safe else
-             ('Guardian Live Monitoring has been activated. Click the live tracking link above to follow their journey.' if guardian_triggered else
-              ('Rapid shaking/running detected on device.' if motion_triggered else
-               (f'Distress word <b>"{trigger_word}"</b> detected.' if voice_triggered else
-                ('<b>LIVE TRACKING ACTIVE</b> — latest position below.' if is_update else 'Emergency Panic Button was activated.'))))}
+            {'<b>🛡️ GUARDIAN MODE ACTIVE</b><br>Someone has started their journey and wants you to monitor them safely. Use the live tracker link below to watch their real-time location until they arrive.' if guardian_mode else ('<b>⚠️ MOTION DISTRESS DETECTION ACTIVE</b><br>Rapid shaking or running motion was automatically detected on the device. Immediate attention required!' if motion_triggered else ('<b>⚠️ VOICE DISTRESS DETECTION ACTIVE</b><br>The word <b>"' + trigger_word + '"</b> was automatically detected by the emergency app. Immediate attention required!' if voice_triggered else ('<b>LIVE TRACKING ACTIVE</b> - Person is moving. Latest position below.' if is_update else 'Emergency Panic Button was activated.')))}
+            <br><br>{'You will be able to track them live using the button below.' if guardian_mode else 'Call emergency services (<b>999</b>) immediately.'}
         </p>
-        {'<p style="color:#2e7d32;font-size:17px;"><b>Destination:</b> ' + destination + '</p>' if destination and not journey_safe else ''}
-        <div style="background:#fff0f0;border-left:4px solid {color};
+        {destination_html}
+        <div style="background:#{'e8f5e9' if guardian_mode else 'fff0f0'};border-left:4px solid {color};
                     padding:15px;border-radius:5px;margin:20px 0;">
             <p style="margin:0;font-size:15px;">
-                Location:<br>
+                {'Current Starting Location' if guardian_mode else 'Location'}:<br>
                 Lat: <code>{lat:.6f}</code><br>
                 Lon: <code>{lon:.6f}</code><br>
                 <small>GPS Accuracy: {acc_text}</small><br>
@@ -231,10 +244,11 @@ Time: {timestamp}
             </p>
         </div>
         <a href="{maps_link}" style="display:block;text-align:center;
-           background:{color};color:white;padding:14px 20px;
-           border-radius:8px;text-decoration:none;font-size:16px;font-weight:bold;margin-top:10px;">
-            Open Location on Google Maps
+           background:{'#1976D2' if guardian_mode else color};color:white;padding:12px 20px;
+           border-radius:8px;text-decoration:none;font-size:15px;font-weight:bold;margin-top:10px;">
+            📍 View Starting Point on Google Maps
         </a>
+        {live_tracker_button}
     </div></body></html>
     """
 
@@ -257,14 +271,13 @@ Time: {timestamp}
 
 def send_to_all(lat, lon, contacts, update_num=None, accuracy=None,
                 voice_triggered=False, trigger_word="", motion_triggered=False,
-                guardian_triggered=False, guardian_session_id=None, destination="",
-                journey_safe=False, base_url=""):
+                guardian_mode=False, guardian_link="", destination=""):
     results = []
     for c in contacts:
         success, error = send_email(
             c["name"], c["email"], lat, lon,
             update_num, accuracy, voice_triggered, trigger_word, motion_triggered,
-            guardian_triggered, guardian_session_id, destination, journey_safe, base_url
+            guardian_mode, guardian_link, destination
         )
         results.append({"name": c["name"], "email": c["email"], "success": success, "error": error})
     return results
@@ -275,94 +288,7 @@ for c in my_contacts:
     if not any(x["email"].lower() == c["email"].lower() for x in all_contacts):
         all_contacts.append(c)
 
-# ===================================================================
-# ---------- GUARDIAN VIEW MODE (when opened via link) ----------
-# ===================================================================
-if guardian_view_id:
-    st.title("👁️ Guardian Live Monitoring")
-    st.info(f"**Session ID:** `{guardian_view_id}`")
-    st.caption("This page auto-refreshes every 10 seconds to show the latest location.")
-
-    # Read guardian data from localStorage
-    guardian_data_raw = streamlit_js_eval(
-        js_expressions=f"localStorage.getItem('guardian_{guardian_view_id}')",
-        key="guardian_view_read"
-    )
-
-    if guardian_data_raw and guardian_data_raw != "null":
-        try:
-            gdata = json.loads(guardian_data_raw)
-            locations = gdata.get("locations", [])
-            destination = gdata.get("destination", "")
-            status = gdata.get("status", "active")
-            started = gdata.get("started", "")
-
-            if status == "safe":
-                st.success("✅ JOURNEY COMPLETE — User has confirmed they are SAFE!")
-            else:
-                st.error("🔴 LIVE TRACKING ACTIVE")
-
-            if destination:
-                st.markdown(f"**📍 Destination:** {destination}")
-            st.markdown(f"**⏱️ Journey started:** {started}")
-            st.markdown(f"**📡 Total updates:** {len(locations)}")
-
-            if locations:
-                latest = locations[-1]
-                lat = latest["lat"]
-                lon = latest["lon"]
-                ts = latest["time"]
-                acc = latest.get("accuracy", "unknown")
-
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.metric("Latitude", f"{lat:.6f}")
-                with col_b:
-                    st.metric("Longitude", f"{lon:.6f}")
-
-                st.markdown(f"**Last update:** {ts} | **Accuracy:** {acc}")
-
-                maps_url = f"https://maps.google.com/?q={lat},{lon}"
-                st.link_button("📍 Open Live Location on Google Maps", maps_url, use_container_width=True)
-
-                # Show trail
-                with st.expander(f"📍 Full location trail ({len(locations)} points)", expanded=False):
-                    for entry in reversed(locations):
-                        st.markdown(
-                            f"**#{entry.get('update', '?')}** at {entry['time']} — "
-                            f"`{entry['lat']:.5f}, {entry['lon']:.5f}` ({entry.get('accuracy','?')}) "
-                            f"[Maps](https://maps.google.com/?q={entry['lat']},{entry['lon']})"
-                        )
-
-                # Embed map iframe
-                st.markdown("### 🗺️ Live Map")
-                st.components.v1.iframe(
-                    f"https://maps.google.com/maps?q={lat},{lon}&z=16&output=embed",
-                    height=400
-                )
-
-            else:
-                st.warning("Waiting for first location update...")
-
-        except Exception as e:
-            st.error(f"Error reading tracking data: {e}")
-    else:
-        st.warning("No tracking data found yet. The user may not have started sharing, or the session has expired.")
-        st.caption("This page will auto-refresh. Ask the user to start Guardian Mode and share the link.")
-
-    # Auto-refresh every 10 seconds
-    st.markdown("---")
-    st.caption("🔄 Auto-refreshing every 10 seconds...")
-    streamlit_js_eval(
-        js_expressions="setTimeout(() => window.location.reload(), 10000); true",
-        key="guardian_auto_refresh"
-    )
-    st.stop()
-
-
-# ===================================================================
 # ---------- MY CONTACT SECTION ----------
-# ===================================================================
 st.divider()
 st.subheader("📋 My Emergency Contacts")
 
@@ -407,132 +333,200 @@ with st.form("add_contact_form", clear_on_submit=True):
 # ==================== GUARDIAN LIVE MONITORING MODE ================
 # ===================================================================
 st.divider()
-st.subheader("👁️ Guardian Live Monitoring Mode")
+st.subheader("🛡️ Guardian Live Monitoring Mode")
 
-st.markdown("""
-<div style="background:linear-gradient(135deg,#1a6b3c,#0d4a6b);color:white;padding:16px 20px;border-radius:10px;margin-bottom:10px;">
-    <b>🛡️ Safe Journey Tracker</b><br>
-    <small>Share a live tracking link with your emergency contacts. They can watch your journey in real-time 
-    until you press <b>"I'm Safe"</b>. Location updates every 10 seconds, non-stop.</small>
-</div>
-""", unsafe_allow_html=True)
-
-# Get base URL for shareable link
-base_url_raw = streamlit_js_eval(
-    js_expressions="window.location.origin + window.location.pathname",
-    key="get_base_url"
+st.caption(
+    "Share your live journey with trusted contacts. They can watch your location "
+    "update in real-time on a map until you press 'I'm Safe'. "
+    "Location updates every 10 seconds."
 )
-base_url = base_url_raw if base_url_raw else ""
 
-g_col1, g_col2 = st.columns([3, 1])
+# ---------- CHECK IF VIEWING AS GUARDIAN ----------
+query_params = st.query_params
+guardian_view_id = query_params.get("guardian", None)
 
-with g_col1:
-    if st.session_state.guardian_active:
-        st.error(f"🔴 GUARDIAN MODE ACTIVE — Tracking non-stop | Updates: {st.session_state.guardian_update_count}")
-    else:
-        st.info("🟢 Guardian Mode is OFF — Press Start to begin a monitored journey")
-
-with g_col2:
-    if not st.session_state.guardian_active:
-        if st.button("🛡️ Start Guardian", use_container_width=True, type="primary"):
-            new_id = str(uuid.uuid4())[:8].upper()
-            st.session_state.guardian_session_id = new_id
-            st.session_state.guardian_active = True
-            st.session_state.guardian_update_count = 0
-            st.session_state.guardian_locations = []
-            st.session_state.guardian_update_key = 0
-            st.session_state.guardian_safe_pressed = False
-            st.rerun()
-    else:
-        if st.button("✅ I'm Safe!", use_container_width=True, type="primary"):
-            st.session_state.guardian_safe_pressed = True
-            st.rerun()
-
-# ---------- GUARDIAN DESTINATION INPUT ----------
-if not st.session_state.guardian_active:
-    st.session_state.guardian_destination = st.text_input(
-        "📍 Where are you going? (optional)",
-        placeholder="e.g. KLCC, University, Home",
-        value=st.session_state.guardian_destination
+if guardian_view_id:
+    # ============================================================
+    # GUARDIAN VIEWER PAGE — shown when contact opens the link
+    # ============================================================
+    st.markdown("---")
+    st.markdown(
+        "<h2 style='text-align:center;color:#0a5c2e;'>🛡️ Guardian Live Tracker</h2>",
+        unsafe_allow_html=True
     )
 
-# ===================================================================
-# ---------- GUARDIAN ACTIVE LOOP ----------
-# ===================================================================
-if st.session_state.guardian_active:
-    session_id = st.session_state.guardian_session_id
-    destination = st.session_state.guardian_destination
+    session_data = guardian_store.get(guardian_view_id)
 
-    # Show shareable link prominently
-    if base_url:
-        share_link = f"{base_url}?guardian={session_id}"
-        st.markdown("### 🔗 Share this link with your Guardian(s):")
-        st.code(share_link, language=None)
-        st.caption("Anyone with this link can watch your location update live every 10 seconds.")
-        st.link_button("📲 Open Guardian View", share_link, use_container_width=False)
+    if not session_data:
+        st.error("❌ This tracking session has expired or does not exist.")
+        st.info("The person may have ended their journey or the session has timed out.")
+        st.stop()
+
+    status = session_data.get("status", "active")
+    locations = session_data.get("locations", [])
+    destination = session_data.get("destination", "")
+    started_at = session_data.get("started_at", "")
+    last_update = session_data.get("last_update", "")
+
+    if status == "ended":
+        st.success("✅ Journey Completed — The person has marked themselves as SAFE!")
+        if locations:
+            last = locations[-1]
+            st.info(f"Last known location: {last['lat']:.6f}, {last['lon']:.6f} at {last['time']}")
+        st.stop()
+
+    # Active tracking view
+    col_stat1, col_stat2, col_stat3 = st.columns(3)
+    with col_stat1:
+        st.metric("Status", "🟢 LIVE")
+    with col_stat2:
+        st.metric("Updates", len(locations))
+    with col_stat3:
+        st.metric("Last Update", last_update or "Waiting...")
 
     if destination:
         st.info(f"📍 Destination: **{destination}**")
 
-    # Handle "I'm Safe" confirmation
-    if st.session_state.guardian_safe_pressed:
-        st.success("✅ Sending SAFE confirmation to all contacts...")
+    if locations:
+        latest = locations[-1]
+        lat_now = latest["lat"]
+        lon_now = latest["lon"]
+        acc_now = latest.get("accuracy", "unknown")
+        time_now = latest["time"]
 
-        safe_loc = streamlit_js_eval(
-            js_expressions="""
-            new Promise(resolve => {
-                navigator.geolocation.getCurrentPosition(
-                    p => resolve([p.coords.latitude, p.coords.longitude, p.coords.accuracy]),
-                    () => resolve(null),
-                    { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-                );
-            })""",
-            key="guardian_safe_loc"
+        st.markdown(
+            f"### 📍 Current Location\n"
+            f"**Lat:** `{lat_now:.6f}` | **Lon:** `{lon_now:.6f}` | **Accuracy:** {acc_now}"
         )
 
-        safe_lat = safe_loc[0] if safe_loc else (st.session_state.guardian_locations[-1]["lat"] if st.session_state.guardian_locations else 0)
-        safe_lon = safe_loc[1] if safe_loc else (st.session_state.guardian_locations[-1]["lon"] if st.session_state.guardian_locations else 0)
-
-        # Mark session as safe in localStorage
-        safe_payload = json.dumps({
-            "locations": st.session_state.guardian_locations,
-            "destination": destination,
-            "status": "safe",
-            "started": st.session_state.guardian_locations[0]["time"] if st.session_state.guardian_locations else datetime.now().strftime("%H:%M:%S"),
-            "ended": datetime.now().strftime("%H:%M:%S")
-        }).replace("'", "\\'")
-        streamlit_js_eval(
-            js_expressions=f"localStorage.setItem('guardian_{session_id}', '{safe_payload}'); true",
-            key="guardian_mark_safe"
+        maps_embed_url = f"https://maps.google.com/maps?q={lat_now},{lon_now}&z=16&output=embed"
+        st.markdown(
+            f"""
+            <div style="border-radius:12px;overflow:hidden;border:2px solid #0a5c2e;margin:10px 0;">
+                <iframe
+                    width="100%" height="400"
+                    src="{maps_embed_url}"
+                    frameborder="0" allowfullscreen
+                    style="display:block;">
+                </iframe>
+            </div>
+            """,
+            unsafe_allow_html=True
         )
 
-        # Send safe email to all contacts
-        with st.spinner("Notifying all contacts that you're safe..."):
-            results = send_to_all(
-                safe_lat, safe_lon, all_contacts,
-                journey_safe=True,
-                destination=destination,
-                base_url=base_url
-            )
-        for r in results:
-            if r["success"]:
-                st.success(f"✅ Safe notification sent to {r['name']}")
-            else:
-                st.error(f"❌ Failed - {r['name']}: {r['error']}")
+        st.link_button(
+            "🗺️ Open in Google Maps (Full View)",
+            f"https://maps.google.com/?q={lat_now},{lon_now}",
+            use_container_width=True
+        )
 
-        total = st.session_state.guardian_update_count
-        st.session_state.guardian_active = False
-        st.session_state.guardian_safe_pressed = False
-        st.session_state.guardian_update_count = 0
-        st.session_state.guardian_locations = []
-        st.balloons()
-        st.success(f"🛡️ Guardian Mode ended safely after {total} location update(s). Stay safe!")
-        st.stop()
+        # Location trail
+        with st.expander(f"📍 Location Trail ({len(locations)} points)", expanded=False):
+            for entry in reversed(locations):
+                st.markdown(
+                    f"**#{entry['update']}** at {entry['time']} — "
+                    f"`{entry['lat']:.5f}, {entry['lon']:.5f}` ({entry.get('accuracy','?')}) "
+                    f"[Maps](https://maps.google.com/?q={entry['lat']},{entry['lon']})"
+                )
+    else:
+        st.info("⏳ Waiting for first location update...")
 
-    # ---------- GUARDIAN LOCATION UPDATE LOOP ----------
+    st.caption(f"Journey started: {started_at} | This page auto-shows latest on refresh.")
+    st.info("🔄 **Refresh this page** to see the latest location update.")
+    st.stop()
+
+
+# ============================================================
+# NORMAL USER VIEW — Guardian Mode Controls
+# ============================================================
+
+# Status display
+g_col1, g_col2, g_col3 = st.columns([3, 1, 1])
+with g_col1:
+    if st.session_state.guardian_active:
+        count_so_far = st.session_state.guardian_update_count
+        st.success(f"🛡️ Guardian Mode ACTIVE — {count_so_far} location update(s) sent")
+    elif st.session_state.guardian_journey_ended:
+        st.success("✅ Journey marked as SAFE — Guardian Mode ended.")
+    else:
+        st.info("🛡️ Guardian Mode is OFF")
+
+with g_col2:
+    if not st.session_state.guardian_active and not st.session_state.guardian_journey_ended:
+        if st.button("🛡️ Start Guardian", use_container_width=True, type="primary"):
+            session_id = str(uuid.uuid4()).replace("-", "")[:16]
+            st.session_state.guardian_session_id = session_id
+            st.session_state.guardian_active = True
+            st.session_state.guardian_update_count = 0
+            st.session_state.guardian_locations = []
+            st.session_state.guardian_link_sent = False
+            st.session_state.guardian_journey_ended = False
+            st.session_state.guardian_loc_key = 0
+            guardian_store[session_id] = {
+                "status": "active",
+                "locations": [],
+                "destination": st.session_state.guardian_destination,
+                "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "last_update": None,
+            }
+            st.rerun()
+
+with g_col3:
+    if st.session_state.guardian_active:
+        if st.button("✅ I'm Safe", use_container_width=True, type="primary"):
+            sid = st.session_state.guardian_session_id
+            if sid and sid in guardian_store:
+                guardian_store[sid]["status"] = "ended"
+            st.session_state.guardian_active = False
+            st.session_state.guardian_journey_ended = True
+            total = st.session_state.guardian_update_count
+            st.session_state.guardian_update_count = 0
+            st.success(f"✅ Marked as SAFE after {total} update(s). Contacts notified.")
+            st.rerun()
+
+# Destination input (only when not active)
+if not st.session_state.guardian_active:
+    dest_input = st.text_input(
+        "📍 Destination (optional)",
+        value=st.session_state.guardian_destination,
+        placeholder="e.g. KLCC, Home, Office...",
+        help="Your contacts will see this as the intended destination."
+    )
+    st.session_state.guardian_destination = dest_input
+
+# ===================================================================
+# ---------- GUARDIAN LIVE TRACKING LOOP ----------
+# ===================================================================
+if st.session_state.guardian_active:
+    sid = st.session_state.guardian_session_id
+
+    # Build tracker link
+    base_url = st.get_option("browser.serverAddress") or "localhost"
+    try:
+        current_url_js = streamlit_js_eval(
+            js_expressions="window.location.href.split('?')[0]",
+            key="get_base_url"
+        )
+        if current_url_js:
+            tracker_link = f"{current_url_js}?guardian={sid}"
+        else:
+            tracker_link = f"http://localhost:8501/?guardian={sid}"
+    except Exception:
+        tracker_link = f"http://localhost:8501/?guardian={sid}"
+
+    # Show the tracker link prominently
+    st.divider()
+    st.success("🛡️ **Guardian Mode ACTIVE** — Contacts can track you live!")
+
+    st.markdown("### 🔗 Share This Link With Your Guardian")
+    st.code(tracker_link, language=None)
+    st.caption("Your emergency contacts have been emailed this link automatically. They can also share it manually.")
+
     g_location_box = st.empty()
-    g_trail_box = st.empty()
+    g_result_box   = st.empty()
+    g_trail_box    = st.empty()
 
+    # Get fresh location every cycle
     g_fresh_loc = streamlit_js_eval(
         js_expressions="""
         new Promise(resolve => {
@@ -542,64 +536,80 @@ if st.session_state.guardian_active:
                 { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
             );
         })""",
-        key=f"guardian_loc_{st.session_state.guardian_update_key}"
+        key=f"guardian_loc_{st.session_state.guardian_loc_key}"
     )
 
     if g_fresh_loc:
-        g_lat = g_fresh_loc[0]
-        g_lon = g_fresh_loc[1]
+        g_lat      = g_fresh_loc[0]
+        g_lon      = g_fresh_loc[1]
         g_accuracy = g_fresh_loc[2] if len(g_fresh_loc) > 2 else None
-        g_acc_str = f"+-{g_accuracy:.0f}m" if g_accuracy else "unknown"
-        g_count = st.session_state.guardian_update_count + 1
-        g_ts = datetime.now().strftime("%H:%M:%S")
+        g_acc_str  = f"+-{g_accuracy:.0f}m" if g_accuracy else "unknown"
+        g_count    = st.session_state.guardian_update_count + 1
+        g_ts       = datetime.now().strftime("%H:%M:%S")
 
-        # Store location entry
-        new_entry = {
+        # Update shared store
+        location_entry = {
             "update": g_count,
             "lat": g_lat,
             "lon": g_lon,
             "accuracy": g_acc_str,
             "time": g_ts
         }
-        st.session_state.guardian_locations.append(new_entry)
+
+        if sid in guardian_store:
+            guardian_store[sid]["locations"].append(location_entry)
+            guardian_store[sid]["last_update"] = g_ts
+            guardian_store[sid]["destination"] = st.session_state.guardian_destination
+
+        st.session_state.guardian_locations.append(location_entry)
         st.session_state.guardian_update_count = g_count
         st.session_state.guardian_last_sent = g_ts
 
-        # Save to localStorage so guardian view can read it
-        payload = json.dumps({
-            "locations": st.session_state.guardian_locations,
-            "destination": destination,
-            "status": "active",
-            "started": st.session_state.guardian_locations[0]["time"] if st.session_state.guardian_locations else g_ts,
-        }).replace("'", "\\'")
-        streamlit_js_eval(
-            js_expressions=f"localStorage.setItem('guardian_{session_id}', '{payload}'); true",
-            key=f"guardian_save_{g_count}"
+        g_location_box.info(
+            f"🛡️ Guardian Update #{g_count} at {g_ts} | "
+            f"{g_lat:.6f}, {g_lon:.6f} | accuracy {g_acc_str}"
         )
 
-        # On first update, send initial email with tracking link to all contacts
-        if g_count == 1:
-            with st.spinner("Sending Guardian alert with live link to all contacts..."):
-                results = send_to_all(
-                    g_lat, g_lon, all_contacts,
-                    guardian_triggered=True,
-                    guardian_session_id=session_id,
-                    destination=destination,
-                    base_url=base_url
-                )
-            for r in results:
-                if r["success"]:
-                    st.success(f"✅ Guardian link sent to {r['name']}")
-                else:
-                    st.error(f"❌ Failed - {r['name']}: {r['error']}")
+        # Send email on first update only
+        if g_count == 1 and not st.session_state.guardian_link_sent:
+            with g_result_box.container():
+                with st.spinner("Notifying your emergency contacts with tracker link..."):
+                    dest = st.session_state.guardian_destination
+                    results = send_to_all(
+                        g_lat, g_lon, all_contacts,
+                        guardian_mode=True,
+                        guardian_link=tracker_link,
+                        destination=dest
+                    )
+                for r in results:
+                    if r["success"]:
+                        st.success(f"✅ Guardian link sent to {r['name']} ({r['email']})")
+                    else:
+                        st.error(f"❌ Failed to notify {r['name']}: {r['error']}")
+            st.session_state.guardian_link_sent = True
 
-        g_location_box.info(
-            f"👁️ Guardian Update #{g_count} at {g_ts} | "
-            f"{g_lat:.6f}, {g_lon:.6f} | Accuracy: {g_acc_str}"
+        # Show embedded map
+        maps_embed = f"https://maps.google.com/maps?q={g_lat},{g_lon}&z=16&output=embed"
+        st.markdown(
+            f"""
+            <div style="border-radius:12px;overflow:hidden;border:2px solid #0a5c2e;margin:10px 0;">
+                <iframe width="100%" height="350"
+                    src="{maps_embed}"
+                    frameborder="0" allowfullscreen style="display:block;">
+                </iframe>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        st.link_button(
+            "🗺️ Open in Google Maps",
+            f"https://maps.google.com/?q={g_lat},{g_lon}",
+            use_container_width=True
         )
 
         with g_trail_box.expander(
-            f"📍 Journey trail ({len(st.session_state.guardian_locations)} points)",
+            f"📍 Your location trail ({len(st.session_state.guardian_locations)} updates)",
             expanded=False
         ):
             for entry in reversed(st.session_state.guardian_locations):
@@ -609,24 +619,34 @@ if st.session_state.guardian_active:
                     f"[Maps](https://maps.google.com/?q={entry['lat']},{entry['lon']})"
                 )
 
-        # Countdown 10 seconds before next update
         g_countdown = st.empty()
         for remaining in range(10, 0, -1):
-            if not st.session_state.guardian_active or st.session_state.guardian_safe_pressed:
+            if not st.session_state.guardian_active:
                 g_countdown.empty()
-                st.rerun()
-            g_countdown.caption(f"🔄 Next location update in {remaining}s... | Guardian tracking active")
+                st.stop()
+            g_countdown.info(
+                f"🛡️ Guardian Mode ON — next update in {remaining}s | "
+                f"Update #{g_count} | Last: {g_ts} | "
+                f"Press '✅ I'm Safe' above when you arrive"
+            )
             time.sleep(1)
         g_countdown.empty()
-
-        st.session_state.guardian_update_key += 1
+        st.session_state.guardian_loc_key += 1
         st.rerun()
 
     else:
-        st.warning("⚠️ Could not get GPS location. Retrying in 5 seconds...")
-        time.sleep(5)
-        st.session_state.guardian_update_key += 1
-        st.rerun()
+        st.error("⚠️ Could not get GPS location. Please allow location access.")
+        g_retry = st.empty()
+        for remaining in range(10, 0, -1):
+            if not st.session_state.guardian_active:
+                g_retry.empty()
+                st.stop()
+            g_retry.warning(f"Retrying GPS in {remaining}s...")
+            time.sleep(1)
+        g_retry.empty()
+        if st.session_state.guardian_active:
+            st.session_state.guardian_loc_key += 1
+            st.rerun()
 
 
 # ===================================================================
@@ -640,6 +660,7 @@ st.caption(
     "Once triggered, location is sent every 30 seconds until you press STOP."
 )
 
+# Sensitivity slider
 motion_threshold = st.slider(
     "Shake sensitivity (lower = more sensitive)",
     min_value=10, max_value=50, value=25, step=5,
@@ -688,6 +709,7 @@ with motion_col3:
             st.success(f"Motion tracking stopped after {total} update(s).")
             st.rerun()
 
+# ---------- INJECT MOTION DETECTION JS ----------
 if st.session_state.motion_monitoring and not st.session_state.motion_triggered and not st.session_state.motion_tracking_active:
     motion_result = streamlit_js_eval(
         js_expressions=f"""
@@ -784,6 +806,9 @@ if st.session_state.motion_monitoring and not st.session_state.motion_triggered 
                 st.session_state.motion_listen_key += 1
                 st.rerun()
 
+# ===================================================================
+# ---------- MOTION LIVE TRACKING LOOP ----------
+# ===================================================================
 if st.session_state.motion_tracking_active:
     st.divider()
     st.error("📳 MOTION DISTRESS DETECTED — LIVE TRACKING ACTIVE")
@@ -881,7 +906,6 @@ if st.session_state.motion_tracking_active:
         if st.session_state.motion_tracking_active:
             st.rerun()
 
-
 # ===================================================================
 # ---------- VOICE RECOGNITION SECTION ----------
 # ===================================================================
@@ -929,6 +953,7 @@ with voice_col3:
             st.success(f"Voice tracking stopped after {total} update(s).")
             st.rerun()
 
+# ---------- INJECT VOICE RECOGNITION JS ----------
 if st.session_state.voice_active and not st.session_state.voice_triggered and not st.session_state.voice_tracking_active:
     keywords_js = json.dumps(DISTRESS_KEYWORDS)
 
@@ -1023,6 +1048,9 @@ if st.session_state.voice_active and not st.session_state.voice_triggered and no
                 time.sleep(0.5)
                 st.rerun()
 
+# ===================================================================
+# ---------- VOICE LIVE TRACKING LOOP ----------
+# ===================================================================
 if st.session_state.voice_tracking_active:
     st.divider()
     trigger_word = st.session_state.voice_trigger_word
@@ -1119,7 +1147,6 @@ if st.session_state.voice_tracking_active:
         if st.session_state.voice_tracking_active:
             st.rerun()
 
-
 # ===================================================================
 # ---------- PANIC BUTTONS ----------
 # ===================================================================
@@ -1128,6 +1155,7 @@ st.caption(f"Alert will be sent to {len(all_contacts)} contact(s).")
 
 col1, col2 = st.columns(2)
 
+# ---- STANDARD PANIC ----
 with col1:
     if st.button("PANIC", use_container_width=True, type="primary", disabled=st.session_state.extreme_active):
         st.session_state.panic_requested = True
@@ -1169,6 +1197,7 @@ with col1:
 
             st.session_state.panic_requested = False
 
+# ---- EXTREME PANIC TOGGLE ----
 with col2:
     if not st.session_state.extreme_active:
         if st.button("EXTREME PANIC - Live Tracking", use_container_width=True):
@@ -1182,6 +1211,9 @@ with col2:
             st.success(f"Tracking stopped after {st.session_state.update_count} update(s).")
             st.rerun()
 
+# ===================================================================
+# ---------- EXTREME PANIC LIVE TRACKING ----------
+# ===================================================================
 if st.session_state.extreme_active:
     st.divider()
     st.error("EXTREME PANIC ACTIVE - LIVE TRACKING ON")
