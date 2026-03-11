@@ -349,7 +349,6 @@ if guardian_view_id:
     # ============================================================
     # GUARDIAN VIEWER PAGE — shown when contact opens the link
     # ============================================================
-    st.markdown("---")
     st.markdown(
         "<h2 style='text-align:center;color:#0a5c2e;'>🛡️ Guardian Live Tracker</h2>",
         unsafe_allow_html=True
@@ -373,14 +372,16 @@ if guardian_view_id:
         if locations:
             last = locations[-1]
             st.info(f"Last known location: {last['lat']:.6f}, {last['lon']:.6f} at {last['time']}")
+            gmaps_url = f"https://maps.google.com/?q={last['lat']},{last['lon']}"
+            st.link_button("📍 View Last Location on Google Maps", gmaps_url, use_container_width=True)
         st.stop()
 
-    # Active tracking view
+    # ---------- ACTIVE TRACKING VIEW ----------
     col_stat1, col_stat2, col_stat3 = st.columns(3)
     with col_stat1:
         st.metric("Status", "🟢 LIVE")
     with col_stat2:
-        st.metric("Updates", len(locations))
+        st.metric("Updates Received", len(locations))
     with col_stat3:
         st.metric("Last Update", last_update or "Waiting...")
 
@@ -395,33 +396,107 @@ if guardian_view_id:
         time_now = latest["time"]
 
         st.markdown(
-            f"### 📍 Current Location\n"
-            f"**Lat:** `{lat_now:.6f}` | **Lon:** `{lon_now:.6f}` | **Accuracy:** {acc_now}"
+            f"**Current Position:** `{lat_now:.6f}, {lon_now:.6f}` | "
+            f"**Accuracy:** {acc_now} | **As of:** {time_now}"
         )
 
-        maps_embed_url = f"https://maps.google.com/maps?q={lat_now},{lon_now}&z=16&output=embed"
-        st.markdown(
-            f"""
-            <div style="border-radius:12px;overflow:hidden;border:2px solid #0a5c2e;margin:10px 0;">
-                <iframe
-                    width="100%" height="400"
-                    src="{maps_embed_url}"
-                    frameborder="0" allowfullscreen
-                    style="display:block;">
-                </iframe>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+        # Build trail points JSON for Leaflet
+        trail_points = [[e["lat"], e["lon"]] for e in locations]
+        trail_json = json.dumps(trail_points)
+        gmaps_url = f"https://maps.google.com/?q={lat_now},{lon_now}"
+
+        # Leaflet.js map — works in all browsers, no iframe restrictions
+        leaflet_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+            <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+            <style>
+                html, body {{ margin:0; padding:0; height:100%; }}
+                #map {{ width:100%; height:420px; border-radius:10px; }}
+                .live-badge {{
+                    position:absolute; top:10px; right:10px; z-index:1000;
+                    background:#0a5c2e; color:white; padding:5px 12px;
+                    border-radius:20px; font-size:13px; font-weight:bold;
+                    box-shadow:0 2px 6px rgba(0,0,0,0.3);
+                    animation: pulse 1.5s infinite;
+                }}
+                @keyframes pulse {{
+                    0%,100% {{ opacity:1; }} 50% {{ opacity:0.6; }}
+                }}
+            </style>
+        </head>
+        <body>
+        <div style="position:relative;">
+            <div id="map"></div>
+            <div class="live-badge">🟢 LIVE</div>
+        </div>
+        <script>
+            var lat = {lat_now};
+            var lon = {lon_now};
+            var trail = {trail_json};
+
+            var map = L.map('map').setView([lat, lon], 16);
+
+            L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+                attribution: '© OpenStreetMap contributors',
+                maxZoom: 19
+            }}).addTo(map);
+
+            // Draw trail line
+            if (trail.length > 1) {{
+                L.polyline(trail, {{
+                    color: '#0a5c2e',
+                    weight: 3,
+                    opacity: 0.7,
+                    dashArray: '5,8'
+                }}).addTo(map);
+            }}
+
+            // Add past location dots
+            for (var i = 0; i < trail.length - 1; i++) {{
+                L.circleMarker(trail[i], {{
+                    radius: 4,
+                    fillColor: '#888',
+                    color: '#555',
+                    weight: 1,
+                    fillOpacity: 0.6
+                }}).addTo(map);
+            }}
+
+            // Current location marker (red pulsing)
+            var redIcon = L.divIcon({{
+                html: '<div style="width:18px;height:18px;background:#e53935;border:3px solid white;border-radius:50%;box-shadow:0 0 0 4px rgba(229,57,53,0.35);animation:pulse 1.5s infinite;"></div>',
+                iconSize: [18, 18],
+                iconAnchor: [9, 9],
+                className: ''
+            }});
+
+            var marker = L.marker([lat, lon], {{icon: redIcon}}).addTo(map);
+            marker.bindPopup(
+                "<b>📍 Current Location</b><br>" +
+                "Lat: " + lat.toFixed(6) + "<br>" +
+                "Lon: " + lon.toFixed(6) + "<br>" +
+                "<small>As of: {time_now}</small>"
+            ).openPopup();
+        </script>
+        </body>
+        </html>
+        """
+
+        st.components.v1.html(leaflet_html, height=430, scrolling=False)
 
         st.link_button(
-            "🗺️ Open in Google Maps (Full View)",
-            f"https://maps.google.com/?q={lat_now},{lon_now}",
+            "🗺️ Open in Google Maps",
+            gmaps_url,
             use_container_width=True
         )
 
-        # Location trail
-        with st.expander(f"📍 Location Trail ({len(locations)} points)", expanded=False):
+        # Location trail expander
+        with st.expander(f"📍 Full Location Trail ({len(locations)} points)", expanded=False):
             for entry in reversed(locations):
                 st.markdown(
                     f"**#{entry['update']}** at {entry['time']} — "
@@ -429,10 +504,22 @@ if guardian_view_id:
                     f"[Maps](https://maps.google.com/?q={entry['lat']},{entry['lon']})"
                 )
     else:
-        st.info("⏳ Waiting for first location update...")
+        st.info("⏳ Waiting for first location update from the traveller...")
 
-    st.caption(f"Journey started: {started_at} | This page auto-shows latest on refresh.")
-    st.info("🔄 **Refresh this page** to see the latest location update.")
+    st.caption(f"Journey started: {started_at}")
+
+    # Auto-refresh every 12 seconds so guardian sees live updates without manual refresh
+    st.markdown(
+        """
+        <script>
+            setTimeout(function() { window.location.reload(); }, 12000);
+        </script>
+        <p style='text-align:center;color:#888;font-size:13px;margin-top:8px;'>
+            🔄 This page auto-refreshes every 12 seconds for live updates.
+        </p>
+        """,
+        unsafe_allow_html=True
+    )
     st.stop()
 
 
@@ -588,19 +675,26 @@ if st.session_state.guardian_active:
                         st.error(f"❌ Failed to notify {r['name']}: {r['error']}")
             st.session_state.guardian_link_sent = True
 
-        # Show embedded map
-        maps_embed = f"https://maps.google.com/maps?q={g_lat},{g_lon}&z=16&output=embed"
-        st.markdown(
-            f"""
-            <div style="border-radius:12px;overflow:hidden;border:2px solid #0a5c2e;margin:10px 0;">
-                <iframe width="100%" height="350"
-                    src="{maps_embed}"
-                    frameborder="0" allowfullscreen style="display:block;">
-                </iframe>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+        # Show Leaflet map (works without iframe restrictions)
+        user_trail_json = json.dumps([[e["lat"], e["lon"]] for e in st.session_state.guardian_locations])
+        user_leaflet_html = f"""<!DOCTYPE html><html>
+        <head>
+            <meta charset="utf-8"/>
+            <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+            <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+            <style>html,body{{margin:0;padding:0;}} #map{{width:100%;height:320px;border-radius:10px;}}</style>
+        </head>
+        <body>
+        <div id="map"></div>
+        <script>
+            var map = L.map('map').setView([{g_lat},{g_lon}], 16);
+            L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{attribution:'© OpenStreetMap',maxZoom:19}}).addTo(map);
+            var trail = {user_trail_json};
+            if(trail.length>1) L.polyline(trail,{{color:'#0a5c2e',weight:3,dashArray:'5,8'}}).addTo(map);
+            var redIcon = L.divIcon({{html:'<div style="width:16px;height:16px;background:#e53935;border:3px solid white;border-radius:50%;box-shadow:0 0 0 4px rgba(229,57,53,0.3);"></div>',iconSize:[16,16],iconAnchor:[8,8],className:''}});
+            L.marker([{g_lat},{g_lon}],{{icon:redIcon}}).addTo(map).bindPopup("📍 Your location<br><small>{g_ts}</small>").openPopup();
+        </script></body></html>"""
+        st.components.v1.html(user_leaflet_html, height=330, scrolling=False)
 
         st.link_button(
             "🗺️ Open in Google Maps",
