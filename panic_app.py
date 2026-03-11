@@ -5,9 +5,11 @@ import smtplib
 import json
 import time
 import uuid
+import base64
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.audio import MIMEAudio
 from email.utils import formatdate, make_msgid
 from streamlit_js_eval import streamlit_js_eval
 from supabase import create_client
@@ -15,11 +17,11 @@ from supabase import create_client
 # ===================================================================
 # ---------- SUPABASE CONFIG ----------
 # ===================================================================
-SUPABASE_URL = "https://zmuqoeihfkzlqzrfkvee.supabase.co"       # 🔁 Replace with your Supabase project URL
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InptdXFvZWloZmt6bHF6cmZrdmVlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMyMzk2MDUsImV4cCI6MjA4ODgxNTYwNX0.AiHQHI1fTnV09Xf2hJb_LB0Hu4cSD9StsAnY1PmNqX8"  # 🔁 Replace with your Supabase anon/public key
+SUPABASE_URL = "https://zmuqoeihfkzlqzrfkvee.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InptdXFvZWloZmt6bHF6cmZrdmVlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMyMzk2MDUsImV4cCI6MjA4ODgxNTYwNX0.AiHQHI1fTnV09Xf2hJb_LB0Hu4cSD9StsAnY1PmNqX8"
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-APP_URL = "https://shathia-panic-app-hitoigbvsxtzbr28mbuzga.streamlit.app/"  # 🔁 Replace with your deployed app URL
+APP_URL = "https://shathia-panic-app-hitoigbvsxtzbr28mbuzga.streamlit.app/"
 
 # ===================================================================
 # ---------- GUARDIAN PAGE DETECTION ----------
@@ -27,9 +29,6 @@ APP_URL = "https://shathia-panic-app-hitoigbvsxtzbr28mbuzga.streamlit.app/"  # �
 track_id = st.query_params.get("track_id")
 
 if track_id:
-    # ---------------------------------------------------------------
-    # GUARDIAN VIEW — shown when opened via tracking link
-    # ---------------------------------------------------------------
     st.set_page_config(page_title="Guardian Live Monitor", page_icon="🛡️", layout="centered")
     st.title("🛡️ Guardian Live Monitoring")
     st.caption(f"Tracking ID: `{track_id}`")
@@ -72,7 +71,7 @@ if track_id:
     except Exception as e:
         status_box.error(f"Error fetching location: {e}")
 
-    st.stop()  # Do not render the rest of the main app for guardian view
+    st.stop()
 
 
 # ===================================================================
@@ -125,6 +124,9 @@ for key, default in [
     ("guardian_id", None),
     ("guardian_update_count", 0),
     ("guardian_tracking_locations", []),
+    # Audio recording keys
+    ("audio_record_key_voice", 0),
+    ("audio_record_key_motion", 0),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -183,46 +185,115 @@ def find_police(lat, lon, radius=5000):
     except Exception:
         return None
 
-# ---------- SEND EMAIL ----------
+# ===================================================================
+# ---------- AUDIO RECORDING JS HELPER ----------
+# ===================================================================
+# Returns base64-encoded WebM audio (10–20 seconds) or an error dict.
+AUDIO_RECORD_JS = """
+new Promise((resolve) => {
+    const RECORD_SECONDS = 15;
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        resolve({ error: 'NOT_SUPPORTED' });
+        return;
+    }
+
+    navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+        .then(stream => {
+            // Pick a supported MIME type
+            const mimeTypes = [
+                'audio/webm;codecs=opus',
+                'audio/webm',
+                'audio/ogg;codecs=opus',
+                'audio/ogg',
+                ''
+            ];
+            let chosenMime = '';
+            for (const mt of mimeTypes) {
+                if (mt === '' || MediaRecorder.isTypeSupported(mt)) {
+                    chosenMime = mt;
+                    break;
+                }
+            }
+
+            const options = chosenMime ? { mimeType: chosenMime } : {};
+            const recorder = new MediaRecorder(stream, options);
+            const chunks   = [];
+
+            recorder.ondataavailable = e => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+
+            recorder.onstop = () => {
+                // Stop all mic tracks
+                stream.getTracks().forEach(t => t.stop());
+
+                const blob   = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    // reader.result = "data:<mime>;base64,<data>"
+                    const b64 = reader.result.split(',')[1];
+                    resolve({ audio_b64: b64, mime: blob.type });
+                };
+                reader.onerror = () => resolve({ error: 'FILEREADER_ERROR' });
+                reader.readAsDataURL(blob);
+            };
+
+            recorder.onerror = e => {
+                stream.getTracks().forEach(t => t.stop());
+                resolve({ error: 'RECORDER_ERROR', detail: String(e) });
+            };
+
+            recorder.start();
+            setTimeout(() => {
+                if (recorder.state !== 'inactive') recorder.stop();
+            }, RECORD_SECONDS * 1000);
+        })
+        .catch(err => resolve({ error: 'MIC_DENIED', detail: String(err) }));
+});
+"""
+
+# ---------- SEND EMAIL (with optional audio attachment) ----------
 def send_email(recipient_name, recipient_email, lat, lon, update_num=None, accuracy=None,
                voice_triggered=False, trigger_word="", motion_triggered=False,
-               guardian_link=None, safe_arrival=False):
+               guardian_link=None, safe_arrival=False,
+               audio_b64=None, audio_mime="audio/webm"):
+
     maps_link = f"https://maps.google.com/?q={lat},{lon}"
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     is_update = update_num is not None
 
     if safe_arrival:
-        subject = "✅ Journey Completed Safely — Guardian Alert"
+        subject    = "✅ Journey Completed Safely — Guardian Alert"
         alert_type = "SAFE"
     elif guardian_link:
-        subject = "🛡️ Guardian Live Monitoring Started — Live Tracking Link"
+        subject    = "🛡️ Guardian Live Monitoring Started — Live Tracking Link"
         alert_type = "GUARDIAN"
     elif motion_triggered:
-        subject = "📳 MOTION ALERT - Shaking/Running Detected - Emergency"
+        subject    = "📳 MOTION ALERT - Shaking/Running Detected - Emergency"
         alert_type = "MOTION"
     elif voice_triggered:
-        subject = "🎙️ VOICE ALERT - Distress Word Detected - Emergency"
+        subject    = "🎙️ VOICE ALERT - Distress Word Detected - Emergency"
         alert_type = "VOICE"
     elif is_update:
-        subject = f"LIVE UPDATE #{update_num} - Emergency Alert - Urgent"
+        subject    = f"LIVE UPDATE #{update_num} - Emergency Alert - Urgent"
         alert_type = "UPDATE"
     else:
-        subject = "Emergency Alert - Urgent Assistance Required"
+        subject    = "Emergency Alert - Urgent Assistance Required"
         alert_type = "PANIC"
 
-    acc_text = f"+-{accuracy:.0f}m" if accuracy else "N/A"
-    voice_note   = f'\n⚠️ Triggered by voice: "{trigger_word}"\n' if voice_triggered else ""
-    motion_note  = "\n⚠️ Triggered by device motion/shaking — person may be in distress!\n" if motion_triggered else ""
+    acc_text      = f"+-{accuracy:.0f}m" if accuracy else "N/A"
+    voice_note    = f'\n⚠️ Triggered by voice: "{trigger_word}"\n' if voice_triggered else ""
+    motion_note   = "\n⚠️ Triggered by device motion/shaking — person may be in distress!\n" if motion_triggered else ""
     guardian_note = f"\n🛡️ Guardian Live Monitoring Link:\n{guardian_link}\n" if guardian_link else ""
-    safe_note    = "\n✅ The person has SAFELY reached their destination. Live tracking has ended.\n" if safe_arrival else ""
+    safe_note     = "\n✅ The person has SAFELY reached their destination. Live tracking has ended.\n" if safe_arrival else ""
+    audio_note    = "\n🎙️ Audio evidence recording is attached to this email.\n" if audio_b64 else ""
 
     plain = f"""{'✅ SAFE ARRIVAL NOTIFICATION' if safe_arrival else ('🛡️ GUARDIAN LIVE MONITORING STARTED' if guardian_link else ('📳 MOTION ALERT' if motion_triggered else ('🎙️ VOICE ALERT' if voice_triggered else ('LIVE TRACKING UPDATE #' + str(update_num) if is_update else 'EMERGENCY ALERT'))))}
 
 Dear {recipient_name},
 
-{'The person has safely reached their destination. Live tracking has ended.' if safe_arrival else ('Guardian Journey has started. Use the link below to monitor live location.' if guardian_link else ('MOTION DETECTED: Rapid shaking or running motion was automatically detected!' if motion_triggered else ('VOICE DISTRESS: The word "' + trigger_word + '" was detected!' if voice_triggered else ('This is a LIVE LOCATION UPDATE.' if is_update else 'Someone triggered the Emergency Panic Button.'))))}
+{'The person has safely reached their destination.' if safe_arrival else ('Guardian Journey has started.' if guardian_link else ('MOTION DETECTED: Rapid shaking or running motion was automatically detected!' if motion_triggered else ('VOICE DISTRESS: The word "' + trigger_word + '" was detected!' if voice_triggered else ('This is a LIVE LOCATION UPDATE.' if is_update else 'Someone triggered the Emergency Panic Button.'))))}
 
-Call emergency services (999) immediately.{voice_note}{motion_note}{guardian_note}{safe_note}
+Call emergency services (999) immediately.{voice_note}{motion_note}{guardian_note}{safe_note}{audio_note}
 Location: {lat:.6f}, {lon:.6f}
 Accuracy: {acc_text}
 Google Maps: {maps_link}
@@ -230,14 +301,14 @@ Time: {timestamp}
 """
 
     if safe_arrival:
-        color = "#1a7a1a"
+        color       = "#1a7a1a"
         header_text = "✅ Safe Arrival Confirmed"
-        body_text = "The person has <b>safely reached their destination</b>. Live tracking has ended."
+        body_text   = "The person has <b>safely reached their destination</b>. Live tracking has ended."
         extra_block = ""
     elif guardian_link:
-        color = "#1a4a7a"
+        color       = "#1a4a7a"
         header_text = "🛡️ Guardian Live Monitoring Active"
-        body_text = "A Guardian Journey has started. Click the button below to view their live location."
+        body_text   = "A Guardian Journey has started. Click the button below to view their live location."
         extra_block = f"""
         <a href="{guardian_link}" style="display:block;text-align:center;
            background:#1a4a7a;color:white;padding:14px 20px;
@@ -247,25 +318,36 @@ Time: {timestamp}
         <p style="text-align:center;font-size:12px;color:#888;">Link: {guardian_link}</p>
         """
     elif motion_triggered:
-        color = "#7B3F00"
+        color       = "#7B3F00"
         header_text = "📳 MOTION ALERT: Device Shaking Detected"
-        body_text = "<b>⚠️ MOTION DISTRESS DETECTION ACTIVE</b><br>Rapid shaking or running motion was automatically detected. Immediate attention required!"
+        body_text   = "<b>⚠️ MOTION DISTRESS DETECTION ACTIVE</b><br>Rapid shaking or running motion was automatically detected. Immediate attention required!"
         extra_block = ""
     elif voice_triggered:
-        color = "#4a0080"
+        color       = "#4a0080"
         header_text = f'🎙️ VOICE ALERT: "{trigger_word}"'
-        body_text = f'<b>⚠️ VOICE DISTRESS DETECTION ACTIVE</b><br>The word <b>"{trigger_word}"</b> was automatically detected. Immediate attention required!'
+        body_text   = f'<b>⚠️ VOICE DISTRESS DETECTION ACTIVE</b><br>The word <b>"{trigger_word}"</b> was automatically detected. Immediate attention required!'
         extra_block = ""
     elif is_update:
-        color = "#8B0000"
+        color       = "#8B0000"
         header_text = f"LIVE UPDATE #{update_num}"
-        body_text = "<b>LIVE TRACKING ACTIVE</b> — Person is moving. Latest position below."
+        body_text   = "<b>LIVE TRACKING ACTIVE</b> — Person is moving. Latest position below."
         extra_block = ""
     else:
-        color = "red"
+        color       = "red"
         header_text = "Emergency Alert"
-        body_text = "Emergency Panic Button was activated."
+        body_text   = "Emergency Panic Button was activated."
         extra_block = ""
+
+    audio_html_block = ""
+    if audio_b64:
+        audio_html_block = """
+        <div style="background:#fff3cd;border-left:4px solid #ff9800;padding:12px;border-radius:5px;margin:15px 0;">
+            <p style="margin:0;font-size:14px;">
+                🎙️ <b>Audio Evidence Attached</b><br>
+                <small>A 15-second audio recording captured at the moment of distress detection is attached to this email.</small>
+            </p>
+        </div>
+        """
 
     html = f"""
     <html><body style="font-family:Arial,sans-serif;background:#f8f8f8;padding:20px;">
@@ -276,6 +358,7 @@ Time: {timestamp}
         <p>Dear <b>{recipient_name}</b>,</p>
         <p>{body_text}<br><br>{'Call emergency services (<b>999</b>) immediately.' if not safe_arrival and not guardian_link else ''}</p>
         {extra_block}
+        {audio_html_block}
         <div style="background:#f0f8ff;border-left:4px solid {color};
                     padding:15px;border-radius:5px;margin:20px 0;">
             <p style="margin:0;font-size:15px;">
@@ -296,15 +379,44 @@ Time: {timestamp}
     """
 
     try:
-        msg = MIMEMultipart("alternative")
+        msg = MIMEMultipart("mixed")
         msg["Subject"]    = subject
         msg["From"]       = f"{SENDER_NAME} <{SENDER_EMAIL}>"
         msg["To"]         = recipient_email
         msg["Reply-To"]   = SENDER_EMAIL
         msg["Date"]       = formatdate(localtime=True)
         msg["Message-ID"] = make_msgid(domain="gmail.com")
-        msg.attach(MIMEText(plain, "plain"))
-        msg.attach(MIMEText(html, "html"))
+
+        # Attach text + HTML as alternative part
+        alt_part = MIMEMultipart("alternative")
+        alt_part.attach(MIMEText(plain, "plain"))
+        alt_part.attach(MIMEText(html, "html"))
+        msg.attach(alt_part)
+
+        # Attach audio if provided
+        if audio_b64:
+            try:
+                audio_bytes = base64.b64decode(audio_b64)
+                # Determine file extension from mime type
+                if "ogg" in audio_mime:
+                    ext = "ogg"
+                    maintype, subtype = "audio", "ogg"
+                else:
+                    ext = "webm"
+                    maintype, subtype = "audio", "webm"
+
+                audio_attachment = MIMEAudio(audio_bytes, _subtype=subtype)
+                ts_filename      = datetime.now().strftime("%Y%m%d_%H%M%S")
+                audio_attachment.add_header(
+                    "Content-Disposition",
+                    "attachment",
+                    filename=f"evidence_{ts_filename}.{ext}"
+                )
+                msg.attach(audio_attachment)
+            except Exception as ae:
+                # Don't fail the whole email if audio attach fails
+                pass
+
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
             server.sendmail(SENDER_EMAIL, recipient_email, msg.as_string())
@@ -312,15 +424,18 @@ Time: {timestamp}
     except Exception as e:
         return False, str(e)
 
+
 def send_to_all(lat, lon, contacts, update_num=None, accuracy=None,
                 voice_triggered=False, trigger_word="", motion_triggered=False,
-                guardian_link=None, safe_arrival=False):
+                guardian_link=None, safe_arrival=False,
+                audio_b64=None, audio_mime="audio/webm"):
     results = []
     for c in contacts:
         success, error = send_email(
             c["name"], c["email"], lat, lon,
             update_num, accuracy, voice_triggered, trigger_word, motion_triggered,
-            guardian_link, safe_arrival
+            guardian_link, safe_arrival,
+            audio_b64=audio_b64, audio_mime=audio_mime
         )
         results.append({"name": c["name"], "email": c["email"], "success": success, "error": error})
     return results
@@ -395,14 +510,13 @@ with guard_col1:
 with guard_col2:
     if not st.session_state.guardian_active:
         if st.button("🛡️ Start Guardian Journey", use_container_width=True, type="primary"):
-            st.session_state.guardian_id = str(uuid.uuid4())[:8]  # short readable ID
+            st.session_state.guardian_id = str(uuid.uuid4())[:8]
             st.session_state.guardian_active = True
             st.session_state.guardian_update_count = 0
             st.session_state.guardian_tracking_locations = []
             st.rerun()
     else:
         if st.button("✅ I Reached Safe", use_container_width=True, type="primary"):
-            # Mark as safe in database
             try:
                 supabase.table("live_tracking").update({"status": "safe"}).eq(
                     "track_id", st.session_state.guardian_id
@@ -410,7 +524,6 @@ with guard_col2:
             except Exception as e:
                 st.warning(f"DB update error: {e}")
 
-            # Get last known location for safe email
             last_locs = st.session_state.guardian_tracking_locations
             if last_locs:
                 last = last_locs[-1]
@@ -424,7 +537,6 @@ with guard_col2:
             st.success(f"✅ Guardians notified you reached safely! ({total} location updates sent)")
             st.rerun()
 
-# ---------- GUARDIAN LIVE TRACKING LOOP ----------
 if st.session_state.guardian_active:
     g_loc_box    = st.empty()
     g_status_box = st.empty()
@@ -453,7 +565,6 @@ if st.session_state.guardian_active:
         g_tid      = st.session_state.guardian_id
         tracking_link = f"{APP_URL}/?track_id={g_tid}"
 
-        # Upsert location to Supabase
         try:
             supabase.table("live_tracking").upsert({
                 "track_id":  g_tid,
@@ -465,7 +576,6 @@ if st.session_state.guardian_active:
         except Exception as e:
             g_status_box.warning(f"DB write error: {e}")
 
-        # On first update — send guardian email with link
         if g_count == 1:
             with st.spinner("Sending live tracking link to guardians..."):
                 results = send_to_all(
@@ -501,7 +611,6 @@ if st.session_state.guardian_active:
                     f"[Maps](https://maps.google.com/?q={entry['lat']},{entry['lon']})"
                 )
 
-        # Wait 5 seconds before next update
         for remaining in range(5, 0, -1):
             if not st.session_state.guardian_active:
                 g_count_box.empty()
@@ -529,10 +638,10 @@ st.subheader("📳 Motion Detection (Shake / Running)")
 
 st.caption(
     "Automatically detects rapid shaking or running motion via the device accelerometer. "
-    "Once triggered, location is sent every 30 seconds until you press STOP."
+    "Once triggered, audio is recorded for 15 seconds, then location is sent every 30 seconds until you press STOP."
 )
 
-motion_threshold    = st.slider("Shake sensitivity (lower = more sensitive)", min_value=10, max_value=50, value=25, step=5)
+motion_threshold     = st.slider("Shake sensitivity (lower = more sensitive)", min_value=10, max_value=50, value=25, step=5)
 motion_confirm_count = st.slider("Confirm shakes needed to trigger", min_value=2, max_value=8, value=3, step=1)
 
 motion_col1, motion_col2, motion_col3 = st.columns([3, 1, 1])
@@ -643,6 +752,26 @@ if st.session_state.motion_tracking_active:
     m_result_box   = st.empty()
     m_trail_box    = st.empty()
 
+    # ---- AUDIO RECORDING on first update ----
+    motion_audio_b64  = None
+    motion_audio_mime = "audio/webm"
+
+    if st.session_state.motion_update_count % 10 == 0:
+        with st.spinner("🎙️ Recording 15-second audio evidence..."):
+            audio_result = streamlit_js_eval(
+                js_expressions=AUDIO_RECORD_JS,
+                key=f"motion_audio_{st.session_state.audio_record_key_motion}"
+            )
+        st.session_state.audio_record_key_motion += 1
+
+        if isinstance(audio_result, dict):
+            if audio_result.get("audio_b64"):
+                motion_audio_b64  = audio_result["audio_b64"]
+                motion_audio_mime = audio_result.get("mime", "audio/webm")
+                st.success("🎙️ Audio evidence recorded — will be attached to alert email.")
+            else:
+                st.warning(f"⚠️ Audio recording failed: {audio_result.get('error', 'unknown')}. Sending alert without audio.")
+
     m_fresh_loc = streamlit_js_eval(
         js_expressions="""
         new Promise(resolve => {
@@ -656,11 +785,12 @@ if st.session_state.motion_tracking_active:
     )
 
     if m_fresh_loc:
-        m_lat = m_fresh_loc[0]; m_lon = m_fresh_loc[1]
+        m_lat      = m_fresh_loc[0]
+        m_lon      = m_fresh_loc[1]
         m_accuracy = m_fresh_loc[2] if len(m_fresh_loc) > 2 else None
         m_acc_str  = f"+-{m_accuracy:.0f}m" if m_accuracy else "unknown"
-        m_count = st.session_state.motion_update_count + 1
-        m_ts    = datetime.now().strftime("%H:%M:%S")
+        m_count    = st.session_state.motion_update_count + 1
+        m_ts       = datetime.now().strftime("%H:%M:%S")
 
         m_location_box.info(f"📳 Motion Update #{m_count} at {m_ts} | {m_lat:.6f}, {m_lon:.6f} | accuracy {m_acc_str}")
 
@@ -674,23 +804,46 @@ if st.session_state.motion_tracking_active:
 
         with m_result_box.container():
             with st.spinner(f"Sending motion update #{m_count}..."):
-                results = send_to_all(m_lat, m_lon, all_contacts, update_num=m_count, accuracy=m_accuracy, motion_triggered=True)
+                results = send_to_all(
+                    m_lat, m_lon, all_contacts,
+                    update_num=m_count, accuracy=m_accuracy,
+                    motion_triggered=True,
+                    # Only attach audio on first update
+                    audio_b64=motion_audio_b64 if m_count % 10 == 1 else None,
+                    audio_mime=motion_audio_mime
+                )
             for r in results:
-                if r["success"]: st.success(f"✅ Motion Update #{m_count} sent to {r['name']}")
-                else:            st.error(f"❌ Failed - {r['name']}: {r['error']}")
+                if r["success"]:
+                    label = f"✅ Motion Update #{m_count} sent to {r['name']}"
+                    if m_count % 10 == 1 and motion_audio_b64:
+                        label += " (with audio evidence 🎙️)"
+                    st.success(label)
+                else:
+                    st.error(f"❌ Failed - {r['name']}: {r['error']}")
 
-        st.session_state.motion_tracking_locations.append({"update": m_count, "lat": m_lat, "lon": m_lon, "accuracy": m_acc_str, "time": m_ts})
+        st.session_state.motion_tracking_locations.append({
+            "update": m_count, "lat": m_lat, "lon": m_lon,
+            "accuracy": m_acc_str, "time": m_ts
+        })
         st.session_state.motion_update_count = m_count
         st.session_state.motion_last_sent    = m_ts
 
-        with m_trail_box.expander(f"📍 Motion trail ({len(st.session_state.motion_tracking_locations)} updates)", expanded=False):
+        with m_trail_box.expander(
+            f"📍 Motion trail ({len(st.session_state.motion_tracking_locations)} updates)",
+            expanded=False
+        ):
             for entry in reversed(st.session_state.motion_tracking_locations):
-                st.markdown(f"**#{entry['update']}** at {entry['time']} - `{entry['lat']:.5f}, {entry['lon']:.5f}` ({entry['accuracy']}) [Maps](https://maps.google.com/?q={entry['lat']},{entry['lon']})")
+                st.markdown(
+                    f"**#{entry['update']}** at {entry['time']} - "
+                    f"`{entry['lat']:.5f}, {entry['lon']:.5f}` ({entry['accuracy']}) "
+                    f"[Maps](https://maps.google.com/?q={entry['lat']},{entry['lon']})"
+                )
 
         m_countdown = st.empty()
         for remaining in range(30, 0, -1):
             if not st.session_state.motion_tracking_active:
-                m_countdown.empty(); st.stop()
+                m_countdown.empty()
+                st.stop()
             m_countdown.info(f"📳 Next motion update in {remaining}s... | Last sent: {m_ts}")
             time.sleep(1)
         m_countdown.empty()
@@ -700,11 +853,13 @@ if st.session_state.motion_tracking_active:
         m_retry = st.empty()
         for remaining in range(10, 0, -1):
             if not st.session_state.motion_tracking_active:
-                m_retry.empty(); st.stop()
+                m_retry.empty()
+                st.stop()
             m_retry.warning(f"Retrying in {remaining} seconds...")
             time.sleep(1)
         m_retry.empty()
-        if st.session_state.motion_tracking_active: st.rerun()
+        if st.session_state.motion_tracking_active:
+            st.rerun()
 
 
 # ===================================================================
@@ -727,15 +882,18 @@ with voice_col1:
 with voice_col2:
     if not st.session_state.voice_active and not st.session_state.voice_tracking_active:
         if st.button("🎙️ Start Listening", use_container_width=True, type="primary"):
-            st.session_state.voice_active      = True
-            st.session_state.voice_triggered   = False
+            st.session_state.voice_active       = True
+            st.session_state.voice_triggered    = False
             st.session_state.voice_trigger_word = ""
             st.session_state.voice_trigger_key += 1
             st.rerun()
     elif st.session_state.voice_active and not st.session_state.voice_tracking_active:
         if st.button("🔇 Stop Listening", use_container_width=True):
             st.session_state.voice_active = False
-            streamlit_js_eval(js_expressions="window._emergencyRecognition && window._emergencyRecognition.stop(); true", key="stop_voice")
+            streamlit_js_eval(
+                js_expressions="window._emergencyRecognition && window._emergencyRecognition.stop(); true",
+                key="stop_voice"
+            )
             st.rerun()
 
 with voice_col3:
@@ -751,7 +909,7 @@ with voice_col3:
             st.rerun()
 
 if st.session_state.voice_active and not st.session_state.voice_triggered and not st.session_state.voice_tracking_active:
-    keywords_js = json.dumps(DISTRESS_KEYWORDS)
+    keywords_js  = json.dumps(DISTRESS_KEYWORDS)
     voice_result = streamlit_js_eval(
         js_expressions=f"""
         new Promise((resolve) => {{
@@ -794,7 +952,7 @@ if st.session_state.voice_active and not st.session_state.voice_triggered and no
                 st.session_state.voice_active           = False
                 st.session_state.voice_update_count     = 0
                 st.session_state.voice_tracking_locations = []
-                st.session_state.voice_trigger_key += 1
+                st.session_state.voice_trigger_key     += 1
                 st.rerun()
             elif voice_result.get("error") == "NOT_SUPPORTED":
                 st.error("❌ Browser doesn't support Speech Recognition. Use Chrome or Edge.")
@@ -817,7 +975,29 @@ if st.session_state.voice_tracking_active:
     st.error(f'🎙️ VOICE DISTRESS DETECTED: "{trigger_word.upper()}" — LIVE TRACKING ACTIVE')
     st.warning("Location is being sent every 30 seconds. Press 🛑 STOP VOICE TRACKING above to end.")
 
-    v_location_box = st.empty(); v_result_box = st.empty(); v_trail_box = st.empty()
+    v_location_box = st.empty()
+    v_result_box   = st.empty()
+    v_trail_box    = st.empty()
+
+    # ---- AUDIO RECORDING on first voice update ----
+    voice_audio_b64  = None
+    voice_audio_mime = "audio/webm"
+
+    if st.session_state.voice_update_count % 10 == 0:
+        with st.spinner("🎙️ Recording 15-second audio evidence..."):
+            audio_result = streamlit_js_eval(
+                js_expressions=AUDIO_RECORD_JS,
+                key=f"voice_audio_{st.session_state.audio_record_key_voice}"
+            )
+        st.session_state.audio_record_key_voice += 1
+
+        if isinstance(audio_result, dict):
+            if audio_result.get("audio_b64"):
+                voice_audio_b64  = audio_result["audio_b64"]
+                voice_audio_mime = audio_result.get("mime", "audio/webm")
+                st.success("🎙️ Audio evidence recorded — will be attached to alert email.")
+            else:
+                st.warning(f"⚠️ Audio recording failed: {audio_result.get('error', 'unknown')}. Sending alert without audio.")
 
     v_fresh_loc = streamlit_js_eval(
         js_expressions="""
@@ -832,11 +1012,12 @@ if st.session_state.voice_tracking_active:
     )
 
     if v_fresh_loc:
-        v_lat = v_fresh_loc[0]; v_lon = v_fresh_loc[1]
+        v_lat      = v_fresh_loc[0]
+        v_lon      = v_fresh_loc[1]
         v_accuracy = v_fresh_loc[2] if len(v_fresh_loc) > 2 else None
         v_acc_str  = f"+-{v_accuracy:.0f}m" if v_accuracy else "unknown"
-        v_count = st.session_state.voice_update_count + 1
-        v_ts    = datetime.now().strftime("%H:%M:%S")
+        v_count    = st.session_state.voice_update_count + 1
+        v_ts       = datetime.now().strftime("%H:%M:%S")
 
         v_location_box.info(f"🎙️ Voice Update #{v_count} at {v_ts} | {v_lat:.6f}, {v_lon:.6f} | accuracy {v_acc_str}")
 
@@ -850,23 +1031,46 @@ if st.session_state.voice_tracking_active:
 
         with v_result_box.container():
             with st.spinner(f"Sending voice update #{v_count}..."):
-                results = send_to_all(v_lat, v_lon, all_contacts, update_num=v_count, accuracy=v_accuracy, voice_triggered=True, trigger_word=trigger_word)
+                results = send_to_all(
+                    v_lat, v_lon, all_contacts,
+                    update_num=v_count, accuracy=v_accuracy,
+                    voice_triggered=True, trigger_word=trigger_word,
+                    # Only attach audio on first update
+                    audio_b64=voice_audio_b64 if v_count % 10 == 1 else None,
+                    audio_mime=voice_audio_mime
+                )
             for r in results:
-                if r["success"]: st.success(f"✅ Voice Update #{v_count} sent to {r['name']}")
-                else:            st.error(f"❌ Failed - {r['name']}: {r['error']}")
+                if r["success"]:
+                    label = f"✅ Voice Update #{v_count} sent to {r['name']}"
+                    if v_count % 10 == 1 and voice_audio_b64:
+                        label += " (with audio evidence 🎙️)"
+                    st.success(label)
+                else:
+                    st.error(f"❌ Failed - {r['name']}: {r['error']}")
 
-        st.session_state.voice_tracking_locations.append({"update": v_count, "lat": v_lat, "lon": v_lon, "accuracy": v_acc_str, "time": v_ts})
+        st.session_state.voice_tracking_locations.append({
+            "update": v_count, "lat": v_lat, "lon": v_lon,
+            "accuracy": v_acc_str, "time": v_ts
+        })
         st.session_state.voice_update_count = v_count
         st.session_state.voice_last_sent    = v_ts
 
-        with v_trail_box.expander(f"📍 Voice trail ({len(st.session_state.voice_tracking_locations)} updates)", expanded=False):
+        with v_trail_box.expander(
+            f"📍 Voice trail ({len(st.session_state.voice_tracking_locations)} updates)",
+            expanded=False
+        ):
             for entry in reversed(st.session_state.voice_tracking_locations):
-                st.markdown(f"**#{entry['update']}** at {entry['time']} - `{entry['lat']:.5f}, {entry['lon']:.5f}` ({entry['accuracy']}) [Maps](https://maps.google.com/?q={entry['lat']},{entry['lon']})")
+                st.markdown(
+                    f"**#{entry['update']}** at {entry['time']} - "
+                    f"`{entry['lat']:.5f}, {entry['lon']:.5f}` ({entry['accuracy']}) "
+                    f"[Maps](https://maps.google.com/?q={entry['lat']},{entry['lon']})"
+                )
 
         v_countdown = st.empty()
         for remaining in range(30, 0, -1):
             if not st.session_state.voice_tracking_active:
-                v_countdown.empty(); st.stop()
+                v_countdown.empty()
+                st.stop()
             v_countdown.info(f"🎙️ Next voice update in {remaining}s... | Last sent: {v_ts}")
             time.sleep(1)
         v_countdown.empty()
@@ -876,11 +1080,13 @@ if st.session_state.voice_tracking_active:
         v_retry = st.empty()
         for remaining in range(10, 0, -1):
             if not st.session_state.voice_tracking_active:
-                v_retry.empty(); st.stop()
+                v_retry.empty()
+                st.stop()
             v_retry.warning(f"Retrying in {remaining} seconds...")
             time.sleep(1)
         v_retry.empty()
-        if st.session_state.voice_tracking_active: st.rerun()
+        if st.session_state.voice_tracking_active:
+            st.rerun()
 
 
 # ===================================================================
@@ -945,7 +1151,9 @@ if st.session_state.extreme_active:
     st.error("EXTREME PANIC ACTIVE - LIVE TRACKING ON")
     st.warning("Location sent every 30 seconds. Press STOP TRACKING above to end.")
 
-    location_box = st.empty(); result_box = st.empty(); trail_box = st.empty()
+    location_box = st.empty()
+    result_box   = st.empty()
+    trail_box    = st.empty()
 
     fresh_loc = streamlit_js_eval(
         js_expressions="""
@@ -960,11 +1168,12 @@ if st.session_state.extreme_active:
     )
 
     if fresh_loc:
-        lat = fresh_loc[0]; lon = fresh_loc[1]
+        lat      = fresh_loc[0]
+        lon      = fresh_loc[1]
         accuracy = fresh_loc[2] if len(fresh_loc) > 2 else None
         acc_str  = f"+-{accuracy:.0f}m" if accuracy else "unknown"
-        count = st.session_state.update_count + 1
-        ts    = datetime.now().strftime("%H:%M:%S")
+        count    = st.session_state.update_count + 1
+        ts       = datetime.now().strftime("%H:%M:%S")
 
         location_box.info(f"Update #{count} at {ts} | {lat:.6f}, {lon:.6f} | accuracy {acc_str}")
 
@@ -975,18 +1184,29 @@ if st.session_state.extreme_active:
                 if r["success"]: st.success(f"Update #{count} sent to {r['name']}")
                 else:            st.error(f"Failed - {r['name']}: {r['error']}")
 
-        st.session_state.tracking_locations.append({"update": count, "lat": lat, "lon": lon, "accuracy": acc_str, "time": ts})
+        st.session_state.tracking_locations.append({
+            "update": count, "lat": lat, "lon": lon,
+            "accuracy": acc_str, "time": ts
+        })
         st.session_state.update_count = count
         st.session_state.last_sent    = ts
 
-        with trail_box.expander(f"Location trail ({len(st.session_state.tracking_locations)} updates)", expanded=False):
+        with trail_box.expander(
+            f"Location trail ({len(st.session_state.tracking_locations)} updates)",
+            expanded=False
+        ):
             for entry in reversed(st.session_state.tracking_locations):
-                st.markdown(f"**#{entry['update']}** at {entry['time']} - `{entry['lat']:.5f}, {entry['lon']:.5f}` ({entry['accuracy']}) [Maps](https://maps.google.com/?q={entry['lat']},{entry['lon']})")
+                st.markdown(
+                    f"**#{entry['update']}** at {entry['time']} - "
+                    f"`{entry['lat']:.5f}, {entry['lon']:.5f}` ({entry['accuracy']}) "
+                    f"[Maps](https://maps.google.com/?q={entry['lat']},{entry['lon']})"
+                )
 
         countdown = st.empty()
         for remaining in range(30, 0, -1):
             if not st.session_state.extreme_active:
-                countdown.empty(); st.stop()
+                countdown.empty()
+                st.stop()
             countdown.info(f"Next update in {remaining} seconds... | Last sent: {ts}")
             time.sleep(1)
         countdown.empty()
@@ -996,8 +1216,10 @@ if st.session_state.extreme_active:
         retry_box = st.empty()
         for remaining in range(10, 0, -1):
             if not st.session_state.extreme_active:
-                retry_box.empty(); st.stop()
+                retry_box.empty()
+                st.stop()
             retry_box.warning(f"Retrying in {remaining} seconds...")
             time.sleep(1)
         retry_box.empty()
-        if st.session_state.extreme_active: st.rerun()
+        if st.session_state.extreme_active:
+            st.rerun()
