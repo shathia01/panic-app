@@ -19,8 +19,8 @@ from camera_live import create_camera_session, stop_camera_session, camera_sende
 # ===================================================================
 # ---------- SUPABASE CONFIG ----------
 # ===================================================================
-SUPABASE_URL = st.secrets.get("https://zmuqoeihfkzlqzrfkvee.supabase.co/", "")
-SUPABASE_KEY = st.secrets.get("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InptdXFvZWloZmt6bHF6cmZrdmVlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMyMzk2MDUsImV4cCI6MjA4ODgxNTYwNX0.AiHQHI1fTnV09Xf2hJb_LB0Hu4cSD9StsAnY1PmNqX8", "")
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
 APP_URL = st.secrets.get("APP_URL", "https://shathia-panic-app-hitoigbvsxtzbr28mbuzga.streamlit.app/")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
