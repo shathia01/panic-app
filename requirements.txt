@@ -2,3 +2,4 @@ streamlit
 requests
 streamlit-js-eval
 supabase
+streamlit-webrtc
