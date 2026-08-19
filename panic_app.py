@@ -14,15 +14,32 @@ from email import encoders
 from email.utils import formatdate, make_msgid
 from streamlit_js_eval import streamlit_js_eval
 from supabase import create_client
+from camera_live import create_camera_session, stop_camera_session, camera_sender, camera_viewer
 
 # ===================================================================
 # ---------- SUPABASE CONFIG ----------
 # ===================================================================
-SUPABASE_URL = "https://zmuqoeihfkzlqzrfkvee.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InptdXFvZWloZmt6bHF6cmZrdmVlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMyMzk2MDUsImV4cCI6MjA4ODgxNTYwNX0.AiHQHI1fTnV09Xf2hJb_LB0Hu4cSD9StsAnY1PmNqX8"
+SUPABASE_URL = st.secrets.get("https://zmuqoeihfkzlqzrfkvee.supabase.co/", "")
+SUPABASE_KEY = st.secrets.get("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InptdXFvZWloZmt6bHF6cmZrdmVlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMyMzk2MDUsImV4cCI6MjA4ODgxNTYwNX0.AiHQHI1fTnV09Xf2hJb_LB0Hu4cSD9StsAnY1PmNqX8", "")
+APP_URL = st.secrets.get("APP_URL", "https://shathia-panic-app-hitoigbvsxtzbr28mbuzga.streamlit.app/")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    st.error("Missing SUPABASE_URL or SUPABASE_KEY in Streamlit secrets.")
+    st.stop()
+
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-APP_URL = "https://shathia-panic-app-hitoigbvsxtzbr28mbuzga.streamlit.app/"
+# ===================================================================
+# ---------- LIVE CAMERA GUARDIAN PAGE ----------
+# ===================================================================
+camera_id = st.query_params.get("camera_id")
+
+if camera_id:
+    st.set_page_config(page_title="Emergency Live Camera", page_icon="🔴", layout="centered")
+    st.title("🔴 Emergency Live Camera")
+    st.warning("You are viewing a private emergency camera session. Do not share this link.")
+    camera_viewer(camera_id, SUPABASE_URL, SUPABASE_KEY)
+    st.stop()
 
 # ===================================================================
 # ---------- GUARDIAN PAGE DETECTION ----------
@@ -81,9 +98,9 @@ if track_id:
 st.title("🚨 One-Click Emergency Panic Button")
 
 # ---------- GMAIL CONFIG ----------
-SENDER_EMAIL        = "shathia190304@gmail.com"
-SENDER_APP_PASSWORD = "kvskirvfdhsscege"
-SENDER_NAME         = "Emergency Alert"
+SENDER_EMAIL        = st.secrets.get("SENDER_EMAIL", "")
+SENDER_APP_PASSWORD = st.secrets.get("SENDER_APP_PASSWORD", "")
+SENDER_NAME         = st.secrets.get("SENDER_NAME", "Emergency Alert")
 
 # ---------- DISTRESS KEYWORDS ----------
 DISTRESS_KEYWORDS = [
@@ -125,6 +142,11 @@ for key, default in [
     ("guardian_id", None),
     ("guardian_update_count", 0),
     ("guardian_tracking_locations", []),
+    # Live emergency camera
+    ("live_camera_active", False),
+    ("live_camera_token", None),
+    ("live_camera_facing", "environment"),
+    ("live_camera_stopped", False),
     # Audio recording keys
     ("audio_record_key_voice", 0),
     ("audio_record_key_motion", 0),
@@ -253,7 +275,7 @@ new Promise((resolve) => {
 # ---------- SEND EMAIL (with optional audio attachment) ----------
 def send_email(recipient_name, recipient_email, lat, lon, update_num=None, accuracy=None,
                voice_triggered=False, trigger_word="", motion_triggered=False,
-               guardian_link=None, safe_arrival=False,
+               guardian_link=None, safe_arrival=False, camera_link=None,
                audio_b64=None, audio_mime="audio/webm"):
 
     maps_link = f"https://maps.google.com/?q={lat},{lon}"
@@ -277,6 +299,7 @@ def send_email(recipient_name, recipient_email, lat, lon, update_num=None, accur
     voice_note    = f'\n⚠️ Triggered by voice: "{trigger_word}"\n' if voice_triggered else ""
     motion_note   = "\n⚠️ Triggered by device motion/shaking — person may be in distress!\n" if motion_triggered else ""
     guardian_note = f"\n🛡️ Guardian Live Monitoring Link:\n{guardian_link}\n" if guardian_link else ""
+    camera_note = f"\n🔴 LIVE CAMERA:\n{camera_link}\n" if camera_link else ""
     safe_note     = "\n✅ The person has SAFELY reached their destination. Live tracking has ended.\n" if safe_arrival else ""
     audio_note    = "\n🎙️ Audio evidence recording is attached to this email.\n" if audio_b64 else ""
 
@@ -286,7 +309,7 @@ Dear {recipient_name},
 
 {'The person has safely reached their destination.' if safe_arrival else ('Guardian Journey has started.' if guardian_link else ('MOTION DETECTED: Rapid shaking or running motion was automatically detected!' if motion_triggered else ('VOICE DISTRESS: The word "' + trigger_word + '" was detected!' if voice_triggered else ('This is a LIVE LOCATION UPDATE.' if is_update else 'Someone triggered the Emergency Panic Button.'))))}
 
-Call emergency services (999) immediately.{voice_note}{motion_note}{guardian_note}{safe_note}{audio_note}
+Call emergency services (999) immediately.{voice_note}{motion_note}{guardian_note}{camera_note}{safe_note}{audio_note}
 Location: {lat:.6f}, {lon:.6f}
 Accuracy: {acc_text}
 Google Maps: {maps_link}
@@ -314,7 +337,17 @@ Time: {timestamp}
         color       = "#7B3F00"
         header_text = "📳 MOTION ALERT: Device Shaking Detected"
         body_text   = "<b>⚠️ MOTION DISTRESS DETECTION ACTIVE</b><br>Rapid shaking or running motion was automatically detected. Immediate attention required!"
-        extra_block = ""
+        if camera_link:
+            extra_block = f"""
+            <a href="{camera_link}" style="display:block;text-align:center;
+               background:#b00020;color:white;padding:16px 20px;
+               border-radius:8px;text-decoration:none;font-size:17px;font-weight:bold;margin:15px 0;">
+                🔴 WATCH LIVE CAMERA
+            </a>
+            <p style="text-align:center;font-size:12px;color:#888;">The camera is peer-to-peer and active while the emergency session is running.</p>
+            """
+        else:
+            extra_block = ""
     elif voice_triggered:
         color       = "#4a0080"
         header_text = f'🎙️ VOICE ALERT: "{trigger_word}"'
@@ -414,14 +447,14 @@ Time: {timestamp}
 
 def send_to_all(lat, lon, contacts, update_num=None, accuracy=None,
                 voice_triggered=False, trigger_word="", motion_triggered=False,
-                guardian_link=None, safe_arrival=False,
+                guardian_link=None, safe_arrival=False, camera_link=None,
                 audio_b64=None, audio_mime="audio/webm"):
     results = []
     for c in contacts:
         success, error = send_email(
             c["name"], c["email"], lat, lon,
             update_num, accuracy, voice_triggered, trigger_word, motion_triggered,
-            guardian_link, safe_arrival,
+            guardian_link, safe_arrival, camera_link,
             audio_b64=audio_b64, audio_mime=audio_mime
         )
         results.append({"name": c["name"], "email": c["email"], "success": success, "error": error})
@@ -659,6 +692,11 @@ with motion_col3:
             st.session_state.motion_tracking_active = False
             st.session_state.motion_monitoring      = False
             st.session_state.motion_triggered       = False
+            if st.session_state.live_camera_token:
+                stop_camera_session(supabase, st.session_state.live_camera_token)
+            st.session_state.live_camera_active = False
+            st.session_state.live_camera_token = None
+            st.session_state.live_camera_stopped = True
             total = st.session_state.motion_update_count
             st.session_state.motion_update_count = 0
             st.session_state.motion_tracking_locations = []
@@ -714,6 +752,17 @@ if st.session_state.motion_monitoring and not st.session_state.motion_triggered 
                 st.session_state.motion_update_count    = 0
                 st.session_state.motion_tracking_locations = []
                 st.session_state.motion_listen_key += 1
+
+                # Start a private live-camera emergency session.
+                try:
+                    st.session_state.live_camera_token = create_camera_session(supabase)
+                    st.session_state.live_camera_active = True
+                    st.session_state.live_camera_stopped = False
+                except Exception as e:
+                    st.session_state.live_camera_token = None
+                    st.session_state.live_camera_active = False
+                    st.warning(f"Live camera session could not start: {e}")
+
                 st.rerun()
             elif motion_result.get("error") == "NOT_SUPPORTED":
                 st.error("❌ Device/browser doesn't support motion detection.")
@@ -734,6 +783,18 @@ if st.session_state.motion_tracking_active:
     st.divider()
     st.error("📳 MOTION DISTRESS DETECTED — LIVE TRACKING ACTIVE")
     st.warning("Location is being sent every 30 seconds. Press 🛑 STOP MOTION TRACKING above to end.")
+
+    # The sender camera stays inside a browser component. It publishes a WebRTC
+    # peer ID to Supabase so the emergency contact can connect from the camera link.
+    if st.session_state.live_camera_active and st.session_state.live_camera_token:
+        st.subheader("🔴 Your Live Emergency Camera")
+        camera_sender(
+            st.session_state.live_camera_token,
+            SUPABASE_URL,
+            SUPABASE_KEY,
+            st.session_state.live_camera_facing
+        )
+        st.caption("Keep this page open. The saved contact can watch your camera while the emergency session is active.")
 
     m_location_box = st.empty()
     m_result_box   = st.empty()
@@ -799,6 +860,7 @@ if st.session_state.motion_tracking_active:
                     m_lat, m_lon, all_contacts,
                     update_num=m_count, accuracy=m_accuracy,
                     motion_triggered=True,
+                    camera_link=(f"{APP_URL}?camera_id={st.session_state.live_camera_token}" if st.session_state.live_camera_token else None),
                     audio_b64=st.session_state.current_audio_b64 if st.session_state.current_audio_b64 else None,
                     audio_mime=st.session_state.current_audio_mime
                 )
