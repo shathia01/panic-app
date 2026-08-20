@@ -136,6 +136,7 @@ for key, default in [
     ("motion_update_count", 0),
     ("motion_tracking_locations", []),
     ("motion_last_sent", None),
+    ("motion_initial_alert_sent", False),
     ("motion_listen_key", 0),
     # Guardian Mode
     ("guardian_active", False),
@@ -325,13 +326,22 @@ Time: {timestamp}
         color       = "#1a4a7a"
         header_text = "🛡️ Guardian Live Monitoring Active"
         body_text   = "A Guardian Journey has started. Click the button below to view their live location."
+        camera_button = f"""
+        <a href="{camera_link}" style="display:block;text-align:center;
+           background:#b00020;color:white;padding:16px 20px;
+           border-radius:8px;text-decoration:none;font-size:17px;font-weight:bold;margin:15px 0;">
+            🔴 WATCH LIVE CAMERA
+        </a>
+        """ if camera_link else ""
         extra_block = f"""
         <a href="{guardian_link}" style="display:block;text-align:center;
            background:#1a4a7a;color:white;padding:14px 20px;
            border-radius:8px;text-decoration:none;font-size:16px;font-weight:bold;margin:15px 0;">
-            🗺️ Open Live Guardian Map
+            🗺️ OPEN LIVE LOCATION
         </a>
-        <p style="text-align:center;font-size:12px;color:#888;">Link: {guardian_link}</p>
+        {camera_button}
+        <p style="text-align:center;font-size:12px;color:#888;">Location link: {guardian_link}</p>
+        {f'<p style="text-align:center;font-size:12px;color:#888;">Camera link: {camera_link}</p>' if camera_link else ''}
         """
     elif motion_triggered:
         color       = "#7B3F00"
@@ -751,7 +761,10 @@ if st.session_state.motion_monitoring and not st.session_state.motion_triggered 
                 st.session_state.motion_monitoring      = False
                 st.session_state.motion_update_count    = 0
                 st.session_state.motion_tracking_locations = []
+                st.session_state.motion_initial_alert_sent = False
                 st.session_state.motion_listen_key += 1
+                # Create a separate live-location ID for the guardian map.
+                st.session_state.guardian_id = str(uuid.uuid4())
 
                 # Start a private live-camera emergency session.
                 try:
@@ -782,7 +795,7 @@ if st.session_state.motion_monitoring and not st.session_state.motion_triggered 
 if st.session_state.motion_tracking_active:
     st.divider()
     st.error("📳 MOTION DISTRESS DETECTED — LIVE TRACKING ACTIVE")
-    st.warning("Location is being sent every 30 seconds. Press 🛑 STOP MOTION TRACKING above to end.")
+    st.warning("📍 Live location is being updated every 30 seconds. 🔴 Live camera is available to saved contacts.")
 
     # The sender camera stays inside a browser component. It publishes a WebRTC
     # peer ID to Supabase so the emergency contact can connect from the camera link.
@@ -801,28 +814,34 @@ if st.session_state.motion_tracking_active:
     m_trail_box    = st.empty()
 
     # ---- SECURE AUDIO RECORDING (Waits properly and stores in session state) ----
-    if st.session_state.motion_update_count % 10 == 0 and st.session_state.current_audio_b64 is None:
+    # Do NOT block the first emergency alert for the 15-second audio recording.
+    # The first GPS + guardian/camera links are sent immediately. Audio can be
+    # captured on the following tracking update.
+    should_record_motion_audio = (
+        st.session_state.motion_update_count > 0
+        and st.session_state.motion_update_count % 10 == 1
+        and st.session_state.current_audio_b64 is None
+    )
+    if should_record_motion_audio:
         with st.spinner("🎙️ Recording 15-second audio evidence..."):
             audio_result = streamlit_js_eval(
                 js_expressions=AUDIO_RECORD_JS,
                 key=f"motion_audio_{st.session_state.audio_record_key_motion}"
             )
 
-        # 1. STOP and wait for javascript to finish 15 seconds of recording
         if audio_result is None:
             st.info("🎙️ Please wait 15 seconds while audio evidence is securely recorded...")
-            st.stop() 
+            st.stop()
 
-        # 2. Store securely so it survives the GPS page reloads
         st.session_state.audio_record_key_motion += 1
         if isinstance(audio_result, dict):
             if audio_result.get("audio_b64"):
                 st.session_state.current_audio_b64  = audio_result["audio_b64"]
                 st.session_state.current_audio_mime = audio_result.get("mime", "audio/webm")
-                st.success("🎙️ Audio evidence recorded — will be attached to alert email.")
+                st.success("🎙️ Audio evidence recorded — will be attached to the next alert update.")
             else:
                 st.warning(f"⚠️ Audio recording failed: {audio_result.get('error', 'unknown')}. Sending alert without audio.")
-                st.session_state.current_audio_b64 = False # Bypass infinite loop on fail
+                st.session_state.current_audio_b64 = False
 
     m_fresh_loc = streamlit_js_eval(
         js_expressions="""
@@ -846,6 +865,18 @@ if st.session_state.motion_tracking_active:
 
         m_location_box.info(f"📳 Motion Update #{m_count} at {m_ts} | {m_lat:.6f}, {m_lon:.6f} | accuracy {m_acc_str}")
 
+        # Publish the motion emergency location immediately so the guardian map works.
+        try:
+            supabase.table("live_tracking").upsert({
+                "track_id": st.session_state.guardian_id,
+                "lat": m_lat,
+                "lon": m_lon,
+                "timestamp": datetime.now().isoformat(),
+                "status": "active"
+            }).execute()
+        except Exception as e:
+            m_result_box.warning(f"Guardian location DB write error: {e}")
+
         if m_count == 1:
             with st.spinner("Finding nearest police..."):
                 police = find_police(m_lat, m_lon) or find_police(m_lat, m_lon, 15000)
@@ -860,6 +891,7 @@ if st.session_state.motion_tracking_active:
                     m_lat, m_lon, all_contacts,
                     update_num=m_count, accuracy=m_accuracy,
                     motion_triggered=True,
+                    guardian_link=(f"{APP_URL}?track_id={st.session_state.guardian_id}" if st.session_state.guardian_id else None),
                     camera_link=(f"{APP_URL}?camera_id={st.session_state.live_camera_token}" if st.session_state.live_camera_token else None),
                     audio_b64=st.session_state.current_audio_b64 if st.session_state.current_audio_b64 else None,
                     audio_mime=st.session_state.current_audio_mime
