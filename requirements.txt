@@ -1,5 +1,5 @@
-streamlit
-requests
-streamlit-js-eval
-supabase
-streamlit-webrtc
+streamlit==1.63.0
+streamlit-js-eval==1.0.0
+supabase==2.31.0
+livekit-api==1.2.1
+requests==2.32.5
