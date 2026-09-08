@@ -155,6 +155,16 @@ def _js(value):
 
 
 def broadcaster_html(livekit_url, token, trigger_label, initial_lat=None, initial_lon=None):
+    """
+    Hidden/discreet broadcaster.
+
+    The user's phone still publishes camera, microphone, GPS, and receives
+    guardian camera-control commands, but NO local camera preview or guardian-
+    viewing status is rendered inside the Streamlit component.
+
+    Browser/OS privacy indicators and permission prompts are intentionally not
+    bypassed or hidden.
+    """
     initial = {"lat": initial_lat, "lon": initial_lon}
 
     return f"""
@@ -164,29 +174,16 @@ def broadcaster_html(livekit_url, token, trigger_label, initial_lat=None, initia
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <script src="{LIVEKIT_JS}"></script>
 <style>
-body {{ margin:0; font-family:Arial,sans-serif; background:#101114; color:#fff; }}
-.wrap {{ padding:14px; }}
-.badge {{ display:inline-block; padding:6px 10px; border-radius:999px; background:#b00020; font-weight:700; }}
-.video-wrap {{ margin-top:12px; background:#000; border-radius:14px; overflow:hidden; min-height:240px; }}
-video {{ width:100%; min-height:240px; max-height:520px; object-fit:cover; background:#000; }}
-.card {{ margin-top:10px; padding:12px; border-radius:10px; background:#1b1d22; }}
-.small {{ color:#b8bdc7; font-size:13px; }}
-.ok {{ color:#73e09a; }}
-.warn {{ color:#ffd166; }}
+html, body {{ margin:0; padding:0; width:100%; height:1px; overflow:hidden; background:transparent; }}
+.hidden {{ display:none !important; }}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <span class="badge">🔴 LIVE EMERGENCY</span>
-  <div class="small" style="margin-top:6px">{html.escape(trigger_label)}</div>
-  <div class="video-wrap"><video id="preview" autoplay muted playsinline></video></div>
-  <div class="card">
-    <div id="status">Connecting live camera and microphone…</div>
-    <div id="camera" class="small" style="margin-top:6px">Camera: back</div>
-    <div id="control" class="small" style="margin-top:4px">Camera switching is controlled by the guardian.</div>
-    <div id="gps" class="small" style="margin-top:6px">Waiting for GPS…</div>
-  </div>
-</div>
+  <!-- Intentionally hidden. There is no local camera preview. -->
+  <div id="status" class="hidden"></div>
+  <div id="camera" class="hidden"></div>
+  <div id="control" class="hidden"></div>
+  <div id="gps" class="hidden"></div>
 <script>
 (async () => {{
   const LK = window.LivekitClient;
@@ -195,7 +192,6 @@ video {{ width:100%; min-height:240px; max-height:520px; object-fit:cover; backg
   const cameraEl = document.getElementById('camera');
   const controlEl = document.getElementById('control');
   const gpsEl = document.getElementById('gps');
-  const preview = document.getElementById('preview');
   const initial = {_js(initial)};
 
   let facing = 'environment';
@@ -205,7 +201,6 @@ video {{ width:100%; min-height:240px; max-height:520px; object-fit:cover; backg
   let gpsSequence = 0;
 
   function showStatus(text, cls='') {{
-    status.className = cls;
     status.textContent = text;
   }}
 
@@ -243,17 +238,13 @@ video {{ width:100%; min-height:240px; max-height:520px; object-fit:cover; backg
     else if (action === 'switch') target = facing === 'environment' ? 'user' : 'environment';
     else return;
 
-    controlEl.textContent = 'Guardian requested ' + (target === 'user' ? 'front' : 'back') + ' camera…';
-
     try {{
       await pub.track.restartTrack({{ facingMode: target }});
       facing = target;
-      cameraEl.textContent = 'Camera: ' + cameraName();
-      controlEl.textContent = 'Camera changed remotely by guardian.';
+      cameraEl.textContent = cameraName();
       await sendCameraStatus(true, 'Camera changed successfully.');
     }} catch (e) {{
       console.error('Camera switch failed', e);
-      controlEl.textContent = 'Camera switch failed on this device/browser.';
       await sendCameraStatus(false, e.message || 'Camera switch failed.');
     }}
   }}
@@ -267,9 +258,8 @@ video {{ width:100%; min-height:240px; max-height:520px; object-fit:cover; backg
         timestamp: Date.now(),
         sequence: gpsSequence,
       }};
-      gpsEl.textContent = `GPS #${{gpsSequence}}: ${{outgoing.lat.toFixed(6)}}, ${{outgoing.lon.toFixed(6)}} ±${{Math.round(outgoing.accuracy || 0)}}m`;
+      gpsEl.textContent = `${{outgoing.lat}},${{outgoing.lon}}`;
       const data = new TextEncoder().encode(JSON.stringify(outgoing));
-      // GPS is intentionally lossy/low-latency. A 5-second heartbeat sends the latest value again.
       await room.localParticipant.publishData(data, {{ reliable: false, topic: 'gps' }});
     }} catch (e) {{
       console.error('GPS publish failed', e);
@@ -287,11 +277,6 @@ video {{ width:100%; min-height:240px; max-height:520px; object-fit:cover; backg
 
   function gpsError(err) {{
     console.warn('GPS error', err);
-    if (latestGps) {{
-      gpsEl.textContent = `GPS temporarily unavailable — keeping last location ${{latestGps.lat.toFixed(6)}}, ${{latestGps.lon.toFixed(6)}}`;
-    }} else {{
-      gpsEl.textContent = 'GPS error: ' + (err && err.message ? err.message : 'unknown');
-    }}
   }}
 
   function startContinuousGps() {{
@@ -299,8 +284,6 @@ video {{ width:100%; min-height:240px; max-height:520px; object-fit:cover; backg
       if (initial.lat != null && initial.lon != null) {{
         latestGps = {{ lat:Number(initial.lat), lon:Number(initial.lon), accuracy:null }};
         publishGpsPayload(latestGps);
-      }} else {{
-        gpsEl.textContent = 'Geolocation is not supported by this browser.';
       }}
       return;
     }}
@@ -309,27 +292,23 @@ video {{ width:100%; min-height:240px; max-height:520px; object-fit:cover; backg
       latestGps = {{ lat:Number(initial.lat), lon:Number(initial.lon), accuracy:null }};
     }}
 
-    // Immediate fresh sample.
     navigator.geolocation.getCurrentPosition(
       onGpsPosition,
       gpsError,
       {{ enableHighAccuracy:true, timeout:12000, maximumAge:0 }}
     );
 
-    // Movement-driven updates.
     gpsWatchId = navigator.geolocation.watchPosition(
       onGpsPosition,
       gpsError,
       {{ enableHighAccuracy:true, timeout:15000, maximumAge:0 }}
     );
 
-    // Heartbeat: guarantees the guardian receives a GPS packet at least every ~5 seconds,
-    // even when the phone is stationary and watchPosition does not emit a new callback.
+    // Repeat the latest known position every 5 seconds, and request a fresh
+    // high-accuracy sample each cycle. This prevents one-shot GPS behaviour
+    // on browsers that do not emit watchPosition while stationary.
     gpsHeartbeatId = setInterval(() => {{
       if (latestGps) publishGpsPayload(latestGps);
-
-      // Also ask for a fresh high-accuracy sample. If a browser chooses not to produce one,
-      // the heartbeat above still keeps the guardian updated with the last known position.
       navigator.geolocation.getCurrentPosition(
         onGpsPosition,
         () => {{}},
@@ -340,19 +319,18 @@ video {{ width:100%; min-height:240px; max-height:520px; object-fit:cover; backg
 
   try {{
     await room.connect({_js(livekit_url)}, {_js(token)});
-    showStatus('Connected. Requesting camera + microphone permission…', 'warn');
+    showStatus('connected');
 
-    const camPub = await room.localParticipant.setCameraEnabled(true, {{ facingMode: 'environment' }});
+    // Publish camera without attaching it to any local <video> element.
+    // The guardian still receives the published track normally.
+    await room.localParticipant.setCameraEnabled(true, {{ facingMode: 'environment' }});
     await room.localParticipant.setMicrophoneEnabled(true);
-    if (camPub && camPub.track) camPub.track.attach(preview);
 
     facing = 'environment';
-    cameraEl.textContent = 'Camera: back';
-    showStatus('🟢 Camera, microphone and live connection active', 'ok');
-
     startContinuousGps();
 
-    // Receive guardian-only data commands. Guardian identities are generated with g_ prefix.
+    // Guardian identities are generated with g_ prefix. Only their data
+    // messages are accepted as camera-control commands.
     room.on(LK.RoomEvent.DataReceived, async (payload, participant, kind, topic) => {{
       if (topic !== 'camera-control') return;
       if (!participant || !participant.identity || !participant.identity.startsWith('g_')) return;
@@ -381,14 +359,13 @@ video {{ width:100%; min-height:240px; max-height:520px; object-fit:cover; backg
     }});
   }} catch (e) {{
     console.error(e);
-    showStatus('❌ Live media failed: ' + (e.message || e), 'warn');
+    showStatus('failed');
   }}
 }})();
 </script>
 </body>
 </html>
 """
-
 
 def viewer_html(livekit_url, token, trigger_label, initial_lat=None, initial_lon=None, status_value="active"):
     initial = {"lat": initial_lat, "lon": initial_lon}
@@ -615,8 +592,8 @@ a.btn {{ background:#0b6cff; color:#fff; }}
 """
 
 
-def render_broadcaster(*args, height=640, **kwargs):
-    components.html(broadcaster_html(*args, **kwargs), height=height, scrolling=True)
+def render_broadcaster(*args, height=1, **kwargs):
+    components.html(broadcaster_html(*args, **kwargs), height=height, scrolling=False)
 
 
 def render_viewer(*args, height=760, **kwargs):
