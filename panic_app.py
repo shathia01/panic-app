@@ -238,15 +238,19 @@ def email_all(lat, lon, **kwargs):
 # LIVE EMERGENCY ENGINE
 # ===================================================================
 def live_emergency_screen(mode, trigger_word=""):
-    st.divider()
+    """Run the emergency broadcaster with a discreet user-facing screen."""
     label = f"{mode.upper()} EMERGENCY"
     if trigger_word:
         label += f' — "{trigger_word}"'
-    st.error(f"🔴 {label} — LIVE CAMERA / AUDIO / GPS ACTIVE")
-    st.warning("Keep this page open. The back camera starts first. Camera switching is controlled remotely by the guardian from the secure live link.")
 
-    if not all_contacts:
-        st.warning("No emergency email contacts are configured. Live streaming can still start, but no alert email can be sent.")
+    # Neutral user-facing screen. No preview, guardian status, live-link status,
+    # camera direction, microphone state, or remote-control information appears.
+    st.title("🛡️ Protection Active")
+    st.caption("Keep this page open so protection can continue.")
+
+    if st.button("✅ I'M SAFE — END PROTECTION", type="primary", use_container_width=True):
+        stop_all_live_modes()
+        st.rerun()
 
     if st.session_state.live_incident is None:
         loc = streamlit_js_eval(
@@ -263,10 +267,10 @@ def live_emergency_screen(mode, trigger_word=""):
             key=f"live_initial_{mode}_{st.session_state.get('voice_trigger_key',0)}_{st.session_state.get('motion_listen_key',0)}",
         )
         if loc is None:
-            st.info("Requesting your location before starting the secure emergency room…")
+            st.caption("Activating protection…")
             st.stop()
         if not isinstance(loc, dict) or loc.get("error"):
-            st.error(f"Location is required for the emergency alert. Error: {(loc or {}).get('error', 'unknown') if isinstance(loc, dict) else 'unknown'}")
+            st.error("Protection could not start because location permission is unavailable.")
             st.stop()
 
         try:
@@ -286,17 +290,18 @@ def live_emergency_screen(mode, trigger_word=""):
             st.session_state.live_incident = incident
             st.session_state.live_initial_location = loc
             st.session_state.live_mode = mode
-        except Exception as e:
-            st.error(f"Could not create emergency live room. Run database/setup.sql first and check LiveKit/Supabase secrets. Details: {e}")
+        except Exception:
+            st.error("Protection could not start. Check the app configuration.")
             st.stop()
 
     incident = st.session_state.live_incident
     loc = st.session_state.live_initial_location
 
+    # Send the guardian link silently from the user-facing screen.
     if not st.session_state.live_alert_sent:
         if all_contacts:
-            with st.spinner("Sending secure live emergency link to saved contacts…"):
-                results = email_all(
+            try:
+                email_all(
                     loc["lat"],
                     loc["lon"],
                     accuracy=loc.get("accuracy"),
@@ -305,32 +310,34 @@ def live_emergency_screen(mode, trigger_word=""):
                     motion_triggered=(mode == "motion"),
                     emergency_live_link=incident["live_link"],
                 )
-            for r in results:
-                if r["success"]:
-                    st.success(f"✅ Live emergency link sent to {r['name']}")
-                else:
-                    st.error(f"❌ Email failed for {r['name']}: {r['error']}")
+            except Exception:
+                # Do not expose contact/guardian details on the user-side screen.
+                pass
         st.session_state.live_alert_sent = True
 
-        with st.spinner("Finding nearest police station…"):
-            police = find_police(loc["lat"], loc["lon"]) or find_police(loc["lat"], loc["lon"], 15000)
-        if police:
-            plat, plon, pname, pdist = police
-            st.success(f"🚔 {pname} — approximately {pdist:.0f}m away")
-            st.link_button("GO TO POLICE NOW", f"https://www.google.com/maps/dir/?api=1&destination={plat},{plon}")
-
-    st.caption(f"Initial location: {loc['lat']:.6f}, {loc['lon']:.6f} | Live link expires automatically.")
+    # Hidden 1px component keeps camera/mic/GPS publishing and accepts guardian
+    # camera-control commands. No local video element is attached.
     render_broadcaster(
         LIVEKIT_URL,
         incident["publisher_token"],
         label,
         initial_lat=loc["lat"],
         initial_lon=loc["lon"],
-        height=640,
+        height=1,
     )
-    st.info("The live media connection stays mounted without 30-second Streamlit reruns. GPS is sent through LiveKit continuously with movement updates plus a 5-second heartbeat, and the guardian can switch the user's front/back camera remotely.")
+
     st.stop()
 
+
+# ===================================================================
+# ACTIVE EMERGENCY ROUTE — render discreet screen before normal dashboard
+# ===================================================================
+if st.session_state.manual_live_active:
+    live_emergency_screen("test", "manual test")
+elif st.session_state.motion_tracking_active:
+    live_emergency_screen("motion")
+elif st.session_state.voice_tracking_active:
+    live_emergency_screen("voice", st.session_state.voice_trigger_word)
 
 # ===================================================================
 # MAIN UI
@@ -453,9 +460,6 @@ with st.expander("🧪 Test Live Emergency (recommended before real use)"):
         if st.button("🛑 STOP TEST"):
             stop_all_live_modes()
             st.rerun()
-if st.session_state.manual_live_active:
-    live_emergency_screen("test", "manual test")
-
 # Motion
 st.divider()
 st.subheader("📳 Motion Detection")
@@ -464,7 +468,7 @@ motion_threshold = st.slider("Shake sensitivity (lower = more sensitive)", 10, 5
 motion_confirm_count = st.slider("Confirm shakes needed", 2, 8, 3, 1)
 mc1, mc2 = st.columns([3, 1])
 if st.session_state.motion_tracking_active:
-    mc1.error("🔴 Motion emergency live session active")
+    mc1.error("🛡️ Motion protection active")
     if mc2.button("🛑 STOP MOTION", type="primary", use_container_width=True):
         stop_all_live_modes()
         st.rerun()
@@ -519,16 +523,13 @@ if st.session_state.motion_monitoring and not st.session_state.motion_tracking_a
             st.session_state.motion_listen_key += 1
             st.rerun()
 
-if st.session_state.motion_tracking_active:
-    live_emergency_screen("motion")
-
 # Voice
 st.divider()
 st.subheader("🎙️ Voice Distress Detection")
 st.caption("Listening for: " + ", ".join(f'“{x}”' for x in DISTRESS_KEYWORDS))
 vc1, vc2 = st.columns([3, 1])
 if st.session_state.voice_tracking_active:
-    vc1.error(f'🔴 Voice emergency active — "{st.session_state.voice_trigger_word}"')
+    vc1.error("🛡️ Voice protection active")
     if vc2.button("🛑 STOP VOICE", type="primary", use_container_width=True):
         stop_all_live_modes()
         st.rerun()
@@ -586,9 +587,6 @@ if st.session_state.voice_active and not st.session_state.voice_tracking_active:
         elif voice_result.get("ended"):
             st.session_state.voice_trigger_key += 1
             st.rerun()
-
-if st.session_state.voice_tracking_active:
-    live_emergency_screen("voice", st.session_state.voice_trigger_word)
 
 # Panic buttons
 st.divider()
