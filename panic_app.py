@@ -88,6 +88,8 @@ if live_id:
             incident["room_name"],
             f"g_{uuid.uuid4().hex}",
             publisher=False,
+            can_publish_data=True,   # guardian may send camera-control data only
+            can_subscribe=True,
         )
         trigger_type = incident.get("trigger_type") or "emergency"
         trigger_word = incident.get("trigger_word") or ""
@@ -241,7 +243,7 @@ def live_emergency_screen(mode, trigger_word=""):
     if trigger_word:
         label += f' — "{trigger_word}"'
     st.error(f"🔴 {label} — LIVE CAMERA / AUDIO / GPS ACTIVE")
-    st.warning("Keep this page open. The back camera is used first. You can switch cameras inside the live panel.")
+    st.warning("Keep this page open. The back camera starts first. Camera switching is controlled remotely by the guardian from the secure live link.")
 
     if not all_contacts:
         st.warning("No emergency email contacts are configured. Live streaming can still start, but no alert email can be sent.")
@@ -326,7 +328,7 @@ def live_emergency_screen(mode, trigger_word=""):
         initial_lon=loc["lon"],
         height=640,
     )
-    st.info("The live media connection stays mounted without 30-second Streamlit reruns. GPS updates are sent directly through the LiveKit room.")
+    st.info("The live media connection stays mounted without 30-second Streamlit reruns. GPS is sent through LiveKit continuously with movement updates plus a 5-second heartbeat, and the guardian can switch the user's front/back camera remotely.")
     st.stop()
 
 
