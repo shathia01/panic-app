@@ -11,18 +11,47 @@ import streamlit.components.v1 as components
 from livekit import api
 
 
-LIVEKIT_JS = "https://cdn.jsdelivr.net/npm/livekit-client@2.22.2/dist/livekit-client.umd.min.js"
+# Keep the browser SDK pinned so behaviour is repeatable in Streamlit Cloud.
+LIVEKIT_JS = "https://cdn.jsdelivr.net/npm/livekit-client@2.22.3/dist/livekit-client.umd.min.js"
 
 
-def create_livekit_token(api_key, api_secret, room_name, identity, publisher=False, ttl_hours=2):
+def create_livekit_token(
+    api_key,
+    api_secret,
+    room_name,
+    identity,
+    publisher=False,
+    ttl_hours=2,
+    can_publish_data=None,
+    can_subscribe=None,
+):
+    """
+    Create a LiveKit room token.
+
+    Broadcaster:
+      - camera/microphone publishing allowed
+      - realtime GPS/data publishing allowed
+      - data reception allowed so guardian can send camera-control commands
+
+    Guardian:
+      - camera/microphone publishing NOT allowed
+      - media subscription allowed
+      - data publishing can be enabled for remote camera-control commands
+    """
+    if can_publish_data is None:
+        can_publish_data = publisher
+    if can_subscribe is None:
+        can_subscribe = True
+
     grants = api.VideoGrants(
         room_join=True,
         room=room_name,
         can_publish=publisher,
-        can_subscribe=not publisher,
-        can_publish_data=publisher,
+        can_subscribe=can_subscribe,
+        can_publish_data=can_publish_data,
         can_publish_sources=["camera", "microphone"] if publisher else None,
     )
+
     return (
         api.AccessToken(api_key, api_secret)
         .with_identity(identity)
@@ -60,14 +89,34 @@ def validate_signed_live_link(live_view_secret, incident_id, expires, sig):
     return hmac.compare_digest(expected, str(sig or ""))
 
 
-def new_incident(supabase, app_url, live_view_secret, livekit_url, api_key, api_secret,
-                 trigger_type, trigger_word="", lat=None, lon=None, accuracy=None):
+def new_incident(
+    supabase,
+    app_url,
+    live_view_secret,
+    livekit_url,
+    api_key,
+    api_secret,
+    trigger_type,
+    trigger_word="",
+    lat=None,
+    lon=None,
+    accuracy=None,
+):
     incident_id = uuid.uuid4().hex
     room_name = f"emg_{uuid.uuid4().hex}"
     publisher_identity = f"u_{uuid.uuid4().hex}"
+
+    # The user's phone publishes media + GPS, and can receive guardian data commands.
     publisher_token = create_livekit_token(
-        api_key, api_secret, room_name, publisher_identity, publisher=True
+        api_key,
+        api_secret,
+        room_name,
+        publisher_identity,
+        publisher=True,
+        can_publish_data=True,
+        can_subscribe=True,
     )
+
     live_link = create_signed_live_link(app_url, live_view_secret, incident_id)
 
     row = {
@@ -106,10 +155,8 @@ def _js(value):
 
 
 def broadcaster_html(livekit_url, token, trigger_label, initial_lat=None, initial_lon=None):
-    initial = {
-        "lat": initial_lat,
-        "lon": initial_lon,
-    }
+    initial = {"lat": initial_lat, "lon": initial_lon}
+
     return f"""
 <!doctype html>
 <html>
@@ -122,11 +169,7 @@ body {{ margin:0; font-family:Arial,sans-serif; background:#101114; color:#fff; 
 .badge {{ display:inline-block; padding:6px 10px; border-radius:999px; background:#b00020; font-weight:700; }}
 .video-wrap {{ margin-top:12px; background:#000; border-radius:14px; overflow:hidden; min-height:240px; }}
 video {{ width:100%; min-height:240px; max-height:520px; object-fit:cover; background:#000; }}
-.row {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }}
-button {{ border:0; border-radius:10px; padding:11px 14px; font-weight:700; cursor:pointer; }}
-.primary {{ background:#fff; color:#111; }}
-.danger {{ background:#b00020; color:#fff; }}
-.card {{ margin-top:10px; padding:10px; border-radius:10px; background:#1b1d22; }}
+.card {{ margin-top:10px; padding:12px; border-radius:10px; background:#1b1d22; }}
 .small {{ color:#b8bdc7; font-size:13px; }}
 .ok {{ color:#73e09a; }}
 .warn {{ color:#ffd166; }}
@@ -137,13 +180,10 @@ button {{ border:0; border-radius:10px; padding:11px 14px; font-weight:700; curs
   <span class="badge">🔴 LIVE EMERGENCY</span>
   <div class="small" style="margin-top:6px">{html.escape(trigger_label)}</div>
   <div class="video-wrap"><video id="preview" autoplay muted playsinline></video></div>
-  <div class="row">
-    <button id="switch" class="primary">🔄 Switch Camera</button>
-    <button id="mic" class="primary">🎙️ Mute Mic</button>
-    <button id="cam" class="primary">📷 Hide Camera</button>
-  </div>
   <div class="card">
     <div id="status">Connecting live camera and microphone…</div>
+    <div id="camera" class="small" style="margin-top:6px">Camera: back</div>
+    <div id="control" class="small" style="margin-top:4px">Camera switching is controlled by the guardian.</div>
     <div id="gps" class="small" style="margin-top:6px">Waiting for GPS…</div>
   </div>
 </div>
@@ -152,32 +192,150 @@ button {{ border:0; border-radius:10px; padding:11px 14px; font-weight:700; curs
   const LK = window.LivekitClient;
   const room = new LK.Room({{ adaptiveStream: true, dynacast: true }});
   const status = document.getElementById('status');
+  const cameraEl = document.getElementById('camera');
+  const controlEl = document.getElementById('control');
   const gpsEl = document.getElementById('gps');
   const preview = document.getElementById('preview');
-  let facing = 'environment';
-  let micOn = true;
-  let camOn = true;
   const initial = {_js(initial)};
+
+  let facing = 'environment';
+  let latestGps = null;
+  let gpsWatchId = null;
+  let gpsHeartbeatId = null;
+  let gpsSequence = 0;
 
   function showStatus(text, cls='') {{
     status.className = cls;
     status.textContent = text;
   }}
 
-  async function publishGps(pos) {{
+  function cameraName() {{
+    return facing === 'user' ? 'front' : 'back';
+  }}
+
+  async function sendCameraStatus(success=true, message='') {{
     try {{
       const payload = {{
-        lat: pos.coords.latitude,
-        lon: pos.coords.longitude,
-        accuracy: pos.coords.accuracy,
+        type: 'camera_status',
+        facing: facing,
+        camera: cameraName(),
+        success: success,
+        message: message,
         timestamp: Date.now()
       }};
-      gpsEl.textContent = `GPS: ${{payload.lat.toFixed(6)}}, ${{payload.lon.toFixed(6)}} ±${{Math.round(payload.accuracy || 0)}}m`;
       const data = new TextEncoder().encode(JSON.stringify(payload));
+      await room.localParticipant.publishData(data, {{ reliable: true, topic: 'camera-status' }});
+    }} catch (e) {{
+      console.error('Could not publish camera status', e);
+    }}
+  }}
+
+  async function changeCamera(action) {{
+    const pub = room.localParticipant.getTrackPublication(LK.Track.Source.Camera);
+    if (!pub || !pub.track) {{
+      await sendCameraStatus(false, 'Camera track is not available.');
+      return;
+    }}
+
+    let target = facing;
+    if (action === 'front') target = 'user';
+    else if (action === 'back') target = 'environment';
+    else if (action === 'switch') target = facing === 'environment' ? 'user' : 'environment';
+    else return;
+
+    controlEl.textContent = 'Guardian requested ' + (target === 'user' ? 'front' : 'back') + ' camera…';
+
+    try {{
+      await pub.track.restartTrack({{ facingMode: target }});
+      facing = target;
+      cameraEl.textContent = 'Camera: ' + cameraName();
+      controlEl.textContent = 'Camera changed remotely by guardian.';
+      await sendCameraStatus(true, 'Camera changed successfully.');
+    }} catch (e) {{
+      console.error('Camera switch failed', e);
+      controlEl.textContent = 'Camera switch failed on this device/browser.';
+      await sendCameraStatus(false, e.message || 'Camera switch failed.');
+    }}
+  }}
+
+  async function publishGpsPayload(payload) {{
+    if (!payload || typeof payload.lat !== 'number' || typeof payload.lon !== 'number') return;
+    try {{
+      gpsSequence += 1;
+      const outgoing = {{
+        ...payload,
+        timestamp: Date.now(),
+        sequence: gpsSequence,
+      }};
+      gpsEl.textContent = `GPS #${{gpsSequence}}: ${{outgoing.lat.toFixed(6)}}, ${{outgoing.lon.toFixed(6)}} ±${{Math.round(outgoing.accuracy || 0)}}m`;
+      const data = new TextEncoder().encode(JSON.stringify(outgoing));
+      // GPS is intentionally lossy/low-latency. A 5-second heartbeat sends the latest value again.
       await room.localParticipant.publishData(data, {{ reliable: false, topic: 'gps' }});
     }} catch (e) {{
       console.error('GPS publish failed', e);
     }}
+  }}
+
+  async function onGpsPosition(pos) {{
+    latestGps = {{
+      lat: pos.coords.latitude,
+      lon: pos.coords.longitude,
+      accuracy: pos.coords.accuracy,
+    }};
+    await publishGpsPayload(latestGps);
+  }}
+
+  function gpsError(err) {{
+    console.warn('GPS error', err);
+    if (latestGps) {{
+      gpsEl.textContent = `GPS temporarily unavailable — keeping last location ${{latestGps.lat.toFixed(6)}}, ${{latestGps.lon.toFixed(6)}}`;
+    }} else {{
+      gpsEl.textContent = 'GPS error: ' + (err && err.message ? err.message : 'unknown');
+    }}
+  }}
+
+  function startContinuousGps() {{
+    if (!navigator.geolocation) {{
+      if (initial.lat != null && initial.lon != null) {{
+        latestGps = {{ lat:Number(initial.lat), lon:Number(initial.lon), accuracy:null }};
+        publishGpsPayload(latestGps);
+      }} else {{
+        gpsEl.textContent = 'Geolocation is not supported by this browser.';
+      }}
+      return;
+    }}
+
+    if (initial.lat != null && initial.lon != null) {{
+      latestGps = {{ lat:Number(initial.lat), lon:Number(initial.lon), accuracy:null }};
+    }}
+
+    // Immediate fresh sample.
+    navigator.geolocation.getCurrentPosition(
+      onGpsPosition,
+      gpsError,
+      {{ enableHighAccuracy:true, timeout:12000, maximumAge:0 }}
+    );
+
+    // Movement-driven updates.
+    gpsWatchId = navigator.geolocation.watchPosition(
+      onGpsPosition,
+      gpsError,
+      {{ enableHighAccuracy:true, timeout:15000, maximumAge:0 }}
+    );
+
+    // Heartbeat: guarantees the guardian receives a GPS packet at least every ~5 seconds,
+    // even when the phone is stationary and watchPosition does not emit a new callback.
+    gpsHeartbeatId = setInterval(() => {{
+      if (latestGps) publishGpsPayload(latestGps);
+
+      // Also ask for a fresh high-accuracy sample. If a browser chooses not to produce one,
+      // the heartbeat above still keeps the guardian updated with the last known position.
+      navigator.geolocation.getCurrentPosition(
+        onGpsPosition,
+        () => {{}},
+        {{ enableHighAccuracy:true, timeout:4500, maximumAge:0 }}
+      );
+    }}, 5000);
   }}
 
   try {{
@@ -188,47 +346,39 @@ button {{ border:0; border-radius:10px; padding:11px 14px; font-weight:700; curs
     await room.localParticipant.setMicrophoneEnabled(true);
     if (camPub && camPub.track) camPub.track.attach(preview);
 
+    facing = 'environment';
+    cameraEl.textContent = 'Camera: back';
     showStatus('🟢 Camera, microphone and live connection active', 'ok');
 
-    if (navigator.geolocation) {{
-      navigator.geolocation.getCurrentPosition(publishGps, () => {{}}, {{ enableHighAccuracy:true, timeout:10000, maximumAge:0 }});
-      navigator.geolocation.watchPosition(
-        publishGps,
-        err => {{ gpsEl.textContent = 'GPS error: ' + err.message; }},
-        {{ enableHighAccuracy:true, timeout:15000, maximumAge:0 }}
-      );
-    }} else if (initial.lat != null && initial.lon != null) {{
-      gpsEl.textContent = `GPS: ${{Number(initial.lat).toFixed(6)}}, ${{Number(initial.lon).toFixed(6)}}`;
-    }}
+    startContinuousGps();
 
-    document.getElementById('switch').onclick = async () => {{
-      const pub = room.localParticipant.getTrackPublication(LK.Track.Source.Camera);
-      if (!pub || !pub.track) return;
-      facing = facing === 'environment' ? 'user' : 'environment';
+    // Receive guardian-only data commands. Guardian identities are generated with g_ prefix.
+    room.on(LK.RoomEvent.DataReceived, async (payload, participant, kind, topic) => {{
+      if (topic !== 'camera-control') return;
+      if (!participant || !participant.identity || !participant.identity.startsWith('g_')) return;
+
       try {{
-        await pub.track.restartTrack({{ facingMode: facing }});
+        const msg = JSON.parse(new TextDecoder().decode(payload));
+        if (msg && msg.type === 'camera_control') {{
+          await changeCamera(msg.action);
+        }}
       }} catch (e) {{
-        alert('Camera switch was not supported by this device/browser.');
+        console.error('Invalid camera control message', e);
       }}
-    }};
+    }});
 
-    document.getElementById('mic').onclick = async (ev) => {{
-      micOn = !micOn;
-      await room.localParticipant.setMicrophoneEnabled(micOn);
-      ev.target.textContent = micOn ? '🎙️ Mute Mic' : '🎙️ Unmute Mic';
-    }};
-
-    document.getElementById('cam').onclick = async (ev) => {{
-      camOn = !camOn;
-      await room.localParticipant.setCameraEnabled(camOn, {{ facingMode: facing }});
-      ev.target.textContent = camOn ? '📷 Hide Camera' : '📷 Show Camera';
-      if (camOn) {{
-        const pub = room.localParticipant.getTrackPublication(LK.Track.Source.Camera);
-        if (pub && pub.track) pub.track.attach(preview);
+    room.on(LK.RoomEvent.ParticipantConnected, async (participant) => {{
+      if (participant && participant.identity && participant.identity.startsWith('g_')) {{
+        await sendCameraStatus(true, 'Guardian connected.');
+        if (latestGps) await publishGpsPayload(latestGps);
       }}
-    }};
+    }});
 
-    window.addEventListener('beforeunload', () => {{ try {{ room.disconnect(); }} catch(e) {{}} }});
+    window.addEventListener('beforeunload', () => {{
+      try {{ if (gpsWatchId !== null) navigator.geolocation.clearWatch(gpsWatchId); }} catch(e) {{}}
+      try {{ if (gpsHeartbeatId !== null) clearInterval(gpsHeartbeatId); }} catch(e) {{}}
+      try {{ room.disconnect(); }} catch(e) {{}}
+    }});
   }} catch (e) {{
     console.error(e);
     showStatus('❌ Live media failed: ' + (e.message || e), 'warn');
@@ -242,6 +392,7 @@ button {{ border:0; border-radius:10px; padding:11px 14px; font-weight:700; curs
 
 def viewer_html(livekit_url, token, trigger_label, initial_lat=None, initial_lon=None, status_value="active"):
     initial = {"lat": initial_lat, "lon": initial_lon}
+
     return f"""
 <!doctype html>
 <html>
@@ -257,8 +408,10 @@ body {{ margin:0; font-family:Arial,sans-serif; background:#0d0f12; color:#fff; 
 #media {{ background:#000; border-radius:14px; overflow:hidden; min-height:260px; display:flex; align-items:center; justify-content:center; }}
 #media video {{ width:100%; min-height:260px; max-height:520px; object-fit:cover; }}
 #media audio {{ display:none; }}
+.controls {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }}
 button, a.btn {{ border:0; border-radius:10px; padding:12px 14px; font-weight:800; cursor:pointer; text-decoration:none; display:inline-block; }}
 button {{ background:#fff; color:#111; }}
+button:disabled {{ opacity:.45; cursor:not-allowed; }}
 a.btn {{ background:#0b6cff; color:#fff; }}
 .small {{ color:#b8bdc7; font-size:13px; }}
 .ok {{ color:#73e09a; }}
@@ -278,9 +431,20 @@ a.btn {{ background:#0b6cff; color:#fff; }}
   <div id="media" class="card"><div id="waiting">Waiting for user's live camera…</div></div>
 
   <div class="card">
+    <b>📷 Guardian Camera Control</b>
+    <div class="controls">
+      <button id="backCam">⬅️ Back Camera</button>
+      <button id="frontCam">🤳 Front Camera</button>
+      <button id="switchCam">🔄 Switch Camera</button>
+    </div>
+    <div id="cameraStatus" class="small" style="margin-top:8px">Waiting for user's phone…</div>
+  </div>
+
+  <div class="card">
     <div id="status">Connecting securely…</div>
     <div id="gps" style="margin-top:8px">Location waiting…</div>
     <div class="small" id="accuracy" style="margin-top:4px"></div>
+    <div class="small" id="gpsMeta" style="margin-top:4px"></div>
     <div style="margin-top:10px"><a id="maps" class="btn" target="_blank">📍 Open Google Maps</a></div>
   </div>
 </div>
@@ -293,37 +457,125 @@ a.btn {{ background:#0b6cff; color:#fff; }}
   const status = document.getElementById('status');
   const gps = document.getElementById('gps');
   const accuracy = document.getElementById('accuracy');
+  const gpsMeta = document.getElementById('gpsMeta');
   const maps = document.getElementById('maps');
+  const cameraStatus = document.getElementById('cameraStatus');
+  const backCam = document.getElementById('backCam');
+  const frontCam = document.getElementById('frontCam');
+  const switchCam = document.getElementById('switchCam');
   const initial = {_js(initial)};
+
+  let gpsCount = 0;
+  let userConnected = false;
+
+  function setControlEnabled(enabled) {{
+    backCam.disabled = !enabled;
+    frontCam.disabled = !enabled;
+    switchCam.disabled = !enabled;
+  }}
+  setControlEnabled(false);
+
+  function hasUserParticipant() {{
+    for (const p of room.remoteParticipants.values()) {{
+      if (p.identity && p.identity.startsWith('u_')) return true;
+    }}
+    return false;
+  }}
 
   function setGps(p) {{
     if (p.lat == null || p.lon == null) return;
+    gpsCount += 1;
     gps.textContent = `📍 ${{Number(p.lat).toFixed(6)}}, ${{Number(p.lon).toFixed(6)}}`;
-    accuracy.textContent = p.accuracy ? `Accuracy: ±${{Math.round(p.accuracy)}}m` : '';
+    accuracy.textContent = p.accuracy ? `Accuracy: ±${{Math.round(p.accuracy)}}m` : 'Accuracy: unavailable';
     maps.href = `https://maps.google.com/?q=${{p.lat}},${{p.lon}}`;
+
+    const ts = p.timestamp ? new Date(Number(p.timestamp)) : new Date();
+    gpsMeta.textContent = `Live update #${{gpsCount}} • ${{ts.toLocaleTimeString()}}`;
   }}
   setGps(initial);
+
+  async function sendCameraCommand(action) {{
+    if (!userConnected && !hasUserParticipant()) {{
+      cameraStatus.textContent = 'User phone is not connected yet.';
+      cameraStatus.className = 'small warn';
+      return;
+    }}
+
+    try {{
+      cameraStatus.textContent = 'Sending camera command…';
+      cameraStatus.className = 'small warn';
+      const payload = {{
+        type: 'camera_control',
+        action: action,
+        timestamp: Date.now(),
+      }};
+      const data = new TextEncoder().encode(JSON.stringify(payload));
+      await room.localParticipant.publishData(data, {{ reliable: true, topic: 'camera-control' }});
+    }} catch (e) {{
+      cameraStatus.textContent = 'Camera command failed: ' + (e.message || e);
+      cameraStatus.className = 'small warn';
+    }}
+  }}
+
+  backCam.onclick = () => sendCameraCommand('back');
+  frontCam.onclick = () => sendCameraCommand('front');
+  switchCam.onclick = () => sendCameraCommand('switch');
 
   room.on(LK.RoomEvent.TrackSubscribed, (track) => {{
     if (waiting) waiting.style.display = 'none';
     const el = track.attach();
     if (track.kind === LK.Track.Kind.Video) {{
-      el.autoplay = true; el.playsInline = true;
+      el.autoplay = true;
+      el.playsInline = true;
     }}
     if (track.kind === LK.Track.Kind.Audio) el.autoplay = true;
     media.appendChild(el);
   }});
 
   room.on(LK.RoomEvent.TrackUnsubscribed, (track) => track.detach());
+
   room.on(LK.RoomEvent.DataReceived, (payload, participant, kind, topic) => {{
     try {{
-      if (topic && topic !== 'gps') return;
       const p = JSON.parse(new TextDecoder().decode(payload));
-      if (typeof p.lat === 'number' && typeof p.lon === 'number') setGps(p);
+
+      if (topic === 'gps') {{
+        if (typeof p.lat === 'number' && typeof p.lon === 'number') setGps(p);
+        return;
+      }}
+
+      if (topic === 'camera-status' && p && p.type === 'camera_status') {{
+        if (p.success) {{
+          cameraStatus.textContent = `✅ User camera is now ${{p.camera || (p.facing === 'user' ? 'front' : 'back')}}.`;
+          cameraStatus.className = 'small ok';
+        }} else {{
+          cameraStatus.textContent = '⚠️ Camera change failed: ' + (p.message || 'unsupported by device/browser');
+          cameraStatus.className = 'small warn';
+        }}
+      }}
     }} catch (e) {{}}
   }});
-  room.on(LK.RoomEvent.ParticipantConnected, () => {{ status.textContent = '🟢 User connected'; status.className='ok'; }});
-  room.on(LK.RoomEvent.ParticipantDisconnected, () => {{ status.textContent = '⚠️ User connection ended or temporarily lost'; status.className='warn'; }});
+
+  room.on(LK.RoomEvent.ParticipantConnected, (participant) => {{
+    if (participant && participant.identity && participant.identity.startsWith('u_')) {{
+      userConnected = true;
+      status.textContent = '🟢 User connected';
+      status.className = 'ok';
+      cameraStatus.textContent = 'Guardian camera controls ready.';
+      cameraStatus.className = 'small ok';
+      setControlEnabled(true);
+    }}
+  }});
+
+  room.on(LK.RoomEvent.ParticipantDisconnected, (participant) => {{
+    if (participant && participant.identity && participant.identity.startsWith('u_')) {{
+      userConnected = false;
+      status.textContent = '⚠️ User connection ended or temporarily lost';
+      status.className = 'warn';
+      cameraStatus.textContent = 'Waiting for user phone to reconnect…';
+      cameraStatus.className = 'small warn';
+      setControlEnabled(false);
+    }}
+  }});
 
   document.getElementById('sound').onclick = async (ev) => {{
     try {{
@@ -338,14 +590,23 @@ a.btn {{ background:#0b6cff; color:#fff; }}
   try {{
     if ({_js(status_value)} !== 'active') {{
       status.textContent = 'Emergency session has ended.';
-      status.className='warn';
+      status.className = 'warn';
     }}
+
     await room.connect({_js(livekit_url)}, {_js(token)});
     status.textContent = '🟢 Connected to secure live room';
-    status.className='ok';
+    status.className = 'ok';
+
+    userConnected = hasUserParticipant();
+    if (userConnected) {{
+      setControlEnabled(true);
+      cameraStatus.textContent = 'Guardian camera controls ready.';
+      cameraStatus.className = 'small ok';
+    }}
   }} catch (e) {{
     status.textContent = '❌ Could not connect: ' + (e.message || e);
-    status.className='warn';
+    status.className = 'warn';
+    setControlEnabled(false);
   }}
 }})();
 </script>
@@ -358,5 +619,5 @@ def render_broadcaster(*args, height=640, **kwargs):
     components.html(broadcaster_html(*args, **kwargs), height=height, scrolling=True)
 
 
-def render_viewer(*args, height=720, **kwargs):
+def render_viewer(*args, height=760, **kwargs):
     components.html(viewer_html(*args, **kwargs), height=height, scrolling=True)
