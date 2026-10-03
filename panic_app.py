@@ -667,7 +667,10 @@ if st.session_state.panic_requested:
         accuracy = loc[2] if len(loc) > 2 else None
         if all_contacts:
             for r in email_all(lat, lon, accuracy=accuracy):
-                st.success(f"Sent to {r['name']}") if r["success"] else st.error(f"Failed for {r['name']}: {r['error']}")
+                if r["success"]:
+                    st.success(f"Sent to {r['name']}")
+                else:
+                    st.error(f"Failed for {r['name']}: {r['error']}")
         police = lookup_nearest_police(lat, lon)
         render_police_result(police)
         st.session_state.panic_requested = False
