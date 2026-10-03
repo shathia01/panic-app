@@ -16,7 +16,7 @@ from livekit_support import (
     render_viewer,
     validate_signed_live_link,
 )
-from utils import find_police
+from utils import find_police, haversine
 
 
 st.set_page_config(page_title="Shathia Emergency", page_icon="🚨", layout="centered")
@@ -109,6 +109,30 @@ if live_id:
             status_value=incident.get("status", "active"),
             height=730,
         )
+
+        # Voice / motion / test live emergencies use the same improved police
+        # lookup as manual panic. The lookup is performed on the guardian side
+        # so the discreet victim screen does not reveal guardian activity.
+        incident_lat = incident.get("lat")
+        incident_lon = incident.get("lon")
+        if incident_lat is not None and incident_lon is not None:
+            police = None
+            for radius in (5000, 15000, 30000):
+                police = find_police(incident_lat, incident_lon, radius)
+                if police:
+                    break
+            if police:
+                plat, plon, pname, pdist = police
+                distance_text = f"{pdist/1000:.1f} km" if pdist >= 1000 else f"{pdist:.0f} m"
+                st.success(f"🚔 Nearest accessible police station: **{pname}** — approximately {distance_text} by road")
+                st.link_button(
+                    "🚔 DIRECTIONS TO POLICE",
+                    f"https://www.google.com/maps/dir/?api=1&destination={plat},{plon}",
+                    use_container_width=True,
+                )
+            else:
+                st.info("Nearest police station could not be resolved from the current map/routing services.")
+
         st.caption("For immediate danger in Malaysia, contact emergency services at 999.")
     except Exception as e:
         st.error(f"Could not open live emergency: {e}")
@@ -164,6 +188,7 @@ for key, value in [
     ("live_initial_location", None),
     ("live_alert_sent", False),
     ("live_mode", None),
+    ("live_police", None),
     ("guardian_active", False),
     ("guardian_id", None),
     ("guardian_update_count", 0),
@@ -173,6 +198,8 @@ for key, value in [
     ("extreme_active", False),
     ("update_count", 0),
     ("tracking_locations", []),
+    ("extreme_police", None),
+    ("extreme_police_anchor", None),
 ]:
     init(key, value)
 
@@ -188,6 +215,7 @@ def clear_live_session(mark_ended=True):
     st.session_state.live_initial_location = None
     st.session_state.live_alert_sent = False
     st.session_state.live_mode = None
+    st.session_state.live_police = None
 
 
 def stop_all_live_modes():
@@ -231,6 +259,31 @@ def email_all(lat, lon, **kwargs):
         lat,
         lon,
         **kwargs,
+    )
+
+
+def lookup_nearest_police(lat, lon):
+    """Try progressively wider radii using the improved road-aware police lookup."""
+    for radius in (5000, 15000, 30000):
+        police = find_police(lat, lon, radius)
+        if police:
+            return police
+    return None
+
+
+def render_police_result(police, prefix="Nearest accessible police station"):
+    """Display a consistent police result and Google Maps directions button."""
+    if not police:
+        st.info("Nearest police station could not be resolved from the current map/routing services.")
+        return
+
+    plat, plon, pname, pdist = police
+    distance_text = f"{pdist/1000:.1f} km" if pdist >= 1000 else f"{pdist:.0f} m"
+    st.success(f"🚔 {prefix}: **{pname}** — approximately {distance_text} by road")
+    st.link_button(
+        "🚔 GO TO POLICE NOW",
+        f"https://www.google.com/maps/dir/?api=1&destination={plat},{plon}",
+        use_container_width=True,
     )
 
 
@@ -615,11 +668,8 @@ if st.session_state.panic_requested:
         if all_contacts:
             for r in email_all(lat, lon, accuracy=accuracy):
                 st.success(f"Sent to {r['name']}") if r["success"] else st.error(f"Failed for {r['name']}: {r['error']}")
-        police = find_police(lat, lon) or find_police(lat, lon, 15000)
-        if police:
-            plat, plon, pname, pdist = police
-            st.success(f"🚔 {pname} — {pdist:.0f}m away")
-            st.link_button("GO TO POLICE NOW", f"https://www.google.com/maps/dir/?api=1&destination={plat},{plon}")
+        police = lookup_nearest_police(lat, lon)
+        render_police_result(police)
         st.session_state.panic_requested = False
 
 if not st.session_state.extreme_active:
@@ -627,10 +677,14 @@ if not st.session_state.extreme_active:
         st.session_state.extreme_active = True
         st.session_state.update_count = 0
         st.session_state.tracking_locations = []
+        st.session_state.extreme_police = None
+        st.session_state.extreme_police_anchor = None
         st.rerun()
 else:
     if p2.button("STOP EXTREME TRACKING", type="primary", use_container_width=True):
         st.session_state.extreme_active = False
+        st.session_state.extreme_police = None
+        st.session_state.extreme_police_anchor = None
         st.rerun()
 
 if st.session_state.extreme_active:
@@ -651,6 +705,22 @@ if st.session_state.extreme_active:
         if all_contacts:
             email_all(lat, lon, update_num=count, accuracy=accuracy)
         st.info(f"Update #{count}: {lat:.6f}, {lon:.6f}")
+
+        # Find police on the first extreme-panic update, then recalculate only
+        # after the user has moved at least 1 km. This avoids hammering the
+        # routing services every 30 seconds while still adapting to movement.
+        anchor = st.session_state.extreme_police_anchor
+        should_refresh_police = st.session_state.extreme_police is None or anchor is None
+        if anchor is not None and not should_refresh_police:
+            moved = haversine(anchor[0], anchor[1], lat, lon)
+            should_refresh_police = moved >= 1000
+
+        if should_refresh_police:
+            st.session_state.extreme_police = lookup_nearest_police(lat, lon)
+            st.session_state.extreme_police_anchor = (lat, lon)
+
+        render_police_result(st.session_state.extreme_police)
+
         st.session_state.update_count = count
         st.session_state.tracking_locations.append({"lat": lat, "lon": lon, "time": datetime.now().strftime("%H:%M:%S")})
         time.sleep(30)
